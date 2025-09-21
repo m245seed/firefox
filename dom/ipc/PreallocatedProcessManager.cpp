@@ -24,6 +24,7 @@
 #include "prsystem.h"
 
 #include <algorithm>
+#include <cmath>
 
 using namespace mozilla::hal;
 using namespace mozilla::dom;
@@ -79,7 +80,7 @@ class PreallocatedProcessManagerImpl final : public nsIObserver {
   uint32_t GetMinDelayMs() const;
   uint32_t GetMaxDelayMs() const;
   void LogLaunchHeuristics(ContentParent* aParent, uint32_t aDelayMs,
-                           double aAverageDuration,
+                           double aAverageDuration, double aPreviousDelay,
                            bool aMemoryPressure) const;
 
   void RereadPrefs();
@@ -108,6 +109,7 @@ class PreallocatedProcessManagerImpl final : public nsIObserver {
   struct CompletedPrelaunch {
     TimeStamp mStartTime;
     TimeStamp mReadyTime;
+    TimeDuration mDuration;
     bool mMemoryPressure;
   };
   AutoTArray<CompletedPrelaunch, 8> mRecentLaunches;
@@ -452,6 +454,9 @@ void PreallocatedProcessManagerImpl::RecordLaunchCompletion(
   auto& record = *mRecentLaunches.AppendElement();
   record.mStartTime = aStartTime;
   record.mReadyTime = aReadyTime;
+  record.mDuration =
+      (!aReadyTime.IsNull() && !aStartTime.IsNull()) ? aReadyTime - aStartTime
+                                                     : TimeDuration();
   record.mMemoryPressure = memoryPressure;
 
   constexpr size_t kMaxRecentLaunches = 8;
@@ -467,22 +472,23 @@ void PreallocatedProcessManagerImpl::RecordLaunchCompletion(
   for (size_t offset = mRecentLaunches.Length() - sampleCount;
        offset < mRecentLaunches.Length(); ++offset) {
     const auto& sample = mRecentLaunches[offset];
-    totalDurationMs +=
-        (sample.mReadyTime - sample.mStartTime).ToMilliseconds();
+    totalDurationMs += sample.mDuration.ToMilliseconds();
     recentMemoryPressure |= sample.mMemoryPressure;
   }
   const double averageDurationMs =
       sampleCount ? (totalDurationMs / sampleCount) : 0.0;
 
+  const uint32_t previousDelay = mLastComputedDelayMs;
   const uint32_t delayMs = ComputeDynamicDelayMs();
-  LogLaunchHeuristics(aParent, delayMs, averageDurationMs,
+  LogLaunchHeuristics(aParent, delayMs, averageDurationMs, previousDelay,
                       recentMemoryPressure);
 
   PROFILER_MARKER_TEXT(
       "Process", DOM, MarkerTiming::InstantAt(aReadyTime),
-      nsPrintfCString("Prealloc launch %.2fms (avg %.2fms, delay %ums, pressure=%d)",
-                      (aReadyTime - aStartTime).ToMilliseconds(),
-                      averageDurationMs, delayMs, recentMemoryPressure));
+      nsPrintfCString(
+          "Prealloc launch %.2fms (avg %.2fms, prev %ums, delay %ums, pressure=%d)",
+          record.mDuration.ToMilliseconds(), averageDurationMs, previousDelay,
+          delayMs, recentMemoryPressure));
 }
 
 uint32_t PreallocatedProcessManagerImpl::GetMinDelayMs() const {
@@ -497,71 +503,81 @@ uint32_t PreallocatedProcessManagerImpl::GetMaxDelayMs() const {
 
 void PreallocatedProcessManagerImpl::LogLaunchHeuristics(
     ContentParent* aParent, uint32_t aDelayMs, double aAverageDuration,
-    bool aMemoryPressure) const {
-  const double lastDurationMs = mRecentLaunches.IsEmpty()
-                                    ? 0.0
-                                    : (mRecentLaunches.LastElement().mReadyTime -
-                                       mRecentLaunches.LastElement().mStartTime)
-                                          .ToMilliseconds();
+    double aPreviousDelay, bool aMemoryPressure) const {
+  const double lastDurationMs =
+      mRecentLaunches.IsEmpty()
+          ? 0.0
+          : mRecentLaunches.LastElement().mDuration.ToMilliseconds();
   MOZ_LOG(ContentParent::GetLog(), LogLevel::Info,
-          ("Prealloc launch=%p duration=%.2fms avg=%.2fms memory-pressure=%d "
-           "next-delay=%ums",
-           aParent, lastDurationMs, aAverageDuration, aMemoryPressure, aDelayMs));
+          ("Prealloc launch=%p duration=%.2fms avg=%.2fms prev-delay=%.2fms "
+           "memory-pressure=%d next-delay=%ums",
+           aParent, lastDurationMs, aAverageDuration, aPreviousDelay,
+           aMemoryPressure, aDelayMs));
 }
 
 uint32_t PreallocatedProcessManagerImpl::ComputeDynamicDelayMs() const {
-  uint32_t baseDelay = StaticPrefs::dom_ipc_processPrelaunch_delayMs();
+  uint32_t prefDelay = StaticPrefs::dom_ipc_processPrelaunch_delayMs();
   const uint32_t minDelay = GetMinDelayMs();
   const uint32_t maxDelay = GetMaxDelayMs();
 
-  baseDelay = std::max(baseDelay, minDelay);
-  baseDelay = std::min(baseDelay, maxDelay);
+  prefDelay = std::clamp(prefDelay, minDelay, maxDelay);
+
+  auto finalize = [&](uint32_t aDelay) {
+    mLastComputedDelayMs = aDelay;
+    return aDelay;
+  };
 
   if (!StaticPrefs::dom_ipc_processPrelaunch_dynamicDelay_enabled()) {
-    mLastComputedDelayMs = baseDelay;
-    return baseDelay;
+    return finalize(prefDelay);
   }
 
   if (mRecentLaunches.IsEmpty()) {
-    mLastComputedDelayMs = baseDelay;
-    return baseDelay;
+    return finalize(prefDelay);
   }
 
   const size_t sampleCount =
-      std::min<size_t>(mRecentLaunches.Length(), size_t(3));
+      std::min<size_t>(mRecentLaunches.Length(), size_t(4));
   double totalDurationMs = 0.0;
   bool memoryPressure = false;
   for (size_t offset = mRecentLaunches.Length() - sampleCount;
        offset < mRecentLaunches.Length(); ++offset) {
     const auto& sample = mRecentLaunches[offset];
-    totalDurationMs +=
-        (sample.mReadyTime - sample.mStartTime).ToMilliseconds();
+    totalDurationMs += sample.mDuration.ToMilliseconds();
     memoryPressure |= sample.mMemoryPressure;
   }
+
   const double averageDurationMs =
       sampleCount ? (totalDurationMs / sampleCount) : 0.0;
+  const double minDelayDouble = static_cast<double>(minDelay);
+  const double maxDelayDouble = static_cast<double>(maxDelay);
+  double currentDelay =
+      mLastComputedDelayMs ? static_cast<double>(mLastComputedDelayMs)
+                           : static_cast<double>(prefDelay);
 
-  double desiredDelay = static_cast<double>(baseDelay);
+  currentDelay = std::clamp(currentDelay, minDelayDouble, maxDelayDouble);
+
+  double desiredDelay = currentDelay;
   if (memoryPressure) {
-    desiredDelay *= 1.5;
-  } else {
-    constexpr double kCheapLaunchMs = 500.0;
-    constexpr double kContendedLaunchMs = 1500.0;
-    if (averageDurationMs <= kCheapLaunchMs) {
-      desiredDelay *= 0.6;
-    } else if (averageDurationMs >= kContendedLaunchMs) {
-      desiredDelay *= 1.5;
-    } else if (baseDelay > 0) {
-      const double normalizedBase =
-          static_cast<double>(std::max(baseDelay, 1u));
-      desiredDelay *= averageDurationMs / normalizedBase;
+    desiredDelay = std::max(currentDelay * 1.25, averageDurationMs);
+  } else if (averageDurationMs > 0.0) {
+    const double cheapThreshold = currentDelay * 0.7;
+    const double contendedThreshold = currentDelay * 1.3;
+    if (averageDurationMs <= cheapThreshold) {
+      desiredDelay = (currentDelay * 0.5) + (averageDurationMs * 0.5);
+    } else if (averageDurationMs >= contendedThreshold) {
+      desiredDelay = std::max(currentDelay * 1.2, averageDurationMs);
+    } else {
+      desiredDelay = (currentDelay * 0.75) + (averageDurationMs * 0.25);
     }
+  } else {
+    desiredDelay = std::max(minDelayDouble, currentDelay * 0.8);
   }
 
+  desiredDelay = std::clamp(desiredDelay, minDelayDouble, maxDelayDouble);
+
   uint32_t computedDelay =
-      static_cast<uint32_t>(std::max(0.0, desiredDelay));
-  computedDelay = std::max(minDelay, computedDelay);
-  computedDelay = std::min(maxDelay, computedDelay);
+      static_cast<uint32_t>(std::lround(desiredDelay));
+  computedDelay = std::clamp(computedDelay, minDelay, maxDelay);
 
   mLastComputedDelayMs = computedDelay;
   return computedDelay;
