@@ -447,3 +447,89 @@ add_task(async function doTests() {
     Assert.equal(expectedOrder, test.result);
   }
 });
+
+add_task(async function test_adaptive_inactive_duration() {
+  const originalIterateTabs = TestTabUnloaderMethods.iterateTabs;
+
+  const browserStub = {
+    preparedTabs: [],
+    discardedTabs: [],
+    async prepareDiscardBrowser(tab) {
+      this.preparedTabs.push(tab);
+    },
+    discardBrowser(tab) {
+      this.discardedTabs.push(tab);
+      return true;
+    },
+  };
+
+  function createTab(lastAccessed, id) {
+    return {
+      tab: {
+        lastAccessed,
+        keywords: id,
+        process: "1",
+        updateLastUnloadedByTabUnloader() {},
+      },
+      gBrowser: browserStub,
+    };
+  }
+
+  function* iterateTabs() {
+    yield createTab(90, "very-fresh");
+    yield createTab(75, "fresh-but-eligible-later");
+  }
+
+  TestTabUnloaderMethods.iterateTabs = iterateTabs;
+
+  TabUnloader._resetAdaptiveState();
+  const minInactiveDuration = 40;
+
+  let stats = {};
+  let didUnload = await TabUnloader.unloadLeastRecentlyUsedTab(
+    minInactiveDuration,
+    TestTabUnloaderMethods,
+    stats
+  );
+  Assert.ok(
+    !didUnload,
+    "No tab unloaded while only fresh tabs were available."
+  );
+  Assert.ok(
+    stats.skippedFreshDiscardable,
+    "Detected that fresh discardable tabs were skipped."
+  );
+  Assert.equal(
+    TabUnloader._adaptiveMinInactiveDuration,
+    Math.floor(minInactiveDuration / 2),
+    "Adaptive threshold should halve after a failed attempt."
+  );
+
+  browserStub.discardedTabs.length = 0;
+  stats = {};
+  didUnload = await TabUnloader.unloadLeastRecentlyUsedTab(
+    minInactiveDuration,
+    TestTabUnloaderMethods,
+    stats
+  );
+  Assert.ok(didUnload, "Tab becomes unloadable after threshold relaxes.");
+  Assert.equal(
+    browserStub.discardedTabs[browserStub.discardedTabs.length - 1]?.keywords,
+    "fresh-but-eligible-later",
+    "The previously fresh tab was discarded."
+  );
+
+  TabUnloader.observe(null, "memory-pressure-stop");
+  Assert.strictEqual(
+    TabUnloader._adaptiveMinInactiveDuration,
+    null,
+    "Adaptive state resets after memory pressure ends."
+  );
+  Assert.ok(
+    !TabUnloader._pressureEpisodeActive,
+    "Pressure flag cleared after recovery."
+  );
+
+  TestTabUnloaderMethods.iterateTabs = originalIterateTabs;
+  TabUnloader._resetAdaptiveState();
+});
