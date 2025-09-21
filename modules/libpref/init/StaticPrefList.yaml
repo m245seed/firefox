@@ -3402,6 +3402,23 @@
   value: 1000
   mirror: always
 
+# Minimum and maximum bounds for the adaptive prelaunch delay.
+- name: dom.ipc.processPrelaunch.delay.minMs
+  type: uint32_t
+  value: 250
+  mirror: always
+
+- name: dom.ipc.processPrelaunch.delay.maxMs
+  type: uint32_t
+  value: 5000
+  mirror: always
+
+# Enable adaptive prelaunch delay heuristics.
+- name: dom.ipc.processPrelaunch.dynamicDelay.enabled
+  type: bool
+  value: true
+  mirror: always
+
 # Process preallocation cache
 # Only used in fission; in e10s we use 1 always
 - name: dom.ipc.processPrelaunch.fission.number
