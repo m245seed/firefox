@@ -433,6 +433,70 @@ add_task(async function test_adaptive_inactive_duration_integration() {
   TabUnloader._resetAdaptiveState();
 });
 
+add_task(async function test_repeated_pressure_relaxes_inactivity_window() {
+  const MIN_PREF = "browser.tabs.min_inactive_duration_before_unload";
+  const prefSet = [
+    [PREF_ENABLE_UNLOADER, true],
+    [MIN_PREF, 6000],
+  ];
+  if (AppConstants.platform == "macosx") {
+    prefSet.push([PREF_MAC_LOW_MEM_RESPONSE, 3]);
+  }
+  await SpecialPowers.pushPrefEnv({ set: prefSet });
+
+  TabUnloader.init();
+  TabUnloader._resetAdaptiveState();
+
+  const originalTab = gBrowser.selectedTab;
+  const freshTab = await addTab();
+
+  await BrowserTestUtils.switchTab(gBrowser, originalTab);
+
+  const minInactiveDuration = Services.prefs.getIntPref(MIN_PREF);
+  freshTab.lastAccessed = Date.now();
+
+  Services.obs.notifyObservers(null, "memory-pressure", "low-memory");
+
+  await TabUnloader.unloadTabAsync(minInactiveDuration);
+
+  let adaptiveDuration = TabUnloader._adaptiveMinInactiveDuration;
+  Assert.ok(
+    typeof adaptiveDuration == "number" && adaptiveDuration < minInactiveDuration,
+    "Adaptive min inactive duration should shrink after failed unload"
+  );
+
+  Services.obs.notifyObservers(null, "memory-pressure", "low-memory-ongoing");
+
+  const relaxedDuration = TabUnloader._adaptiveMinInactiveDuration;
+  Assert.ok(
+    typeof relaxedDuration == "number" && relaxedDuration <= adaptiveDuration,
+    "Repeated memory-pressure events further relax inactivity window"
+  );
+
+  freshTab.lastAccessed = Date.now() - (relaxedDuration + 500);
+
+  const discarded = BrowserTestUtils.waitForEvent(
+    document,
+    "TabBrowserDiscarded",
+    true
+  );
+  await TabUnloader.unloadTabAsync(minInactiveDuration);
+  await discarded;
+
+  ok(!freshTab.linkedPanel, "Fresh tab becomes discardable after repeated pressure");
+
+  Services.obs.notifyObservers(null, "memory-pressure-stop");
+  is(
+    TabUnloader._adaptiveMinInactiveDuration,
+    null,
+    "Adaptive state resets once memory pressure stops"
+  );
+
+  BrowserTestUtils.removeTab(freshTab);
+  await SpecialPowers.popPrefEnv();
+  TabUnloader._resetAdaptiveState();
+});
+
 // Wait for the WebRTC indicator window to close.
 function awaitWebRTCClose() {
   if (

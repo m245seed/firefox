@@ -175,6 +175,7 @@ export var TabUnloader = {
   _isUnloading: false,
   _pressureEpisodeActive: false,
   _adaptiveMinInactiveDuration: null,
+  _freshnessBlockedDuringEpisode: false,
   _observersRegistered: false,
 
   /**
@@ -391,6 +392,7 @@ export var TabUnloader = {
           `TabUnloader discarded <${remoteType}>`
         );
         tabInfo.tab.updateLastUnloadedByTabUnloader();
+        this._freshnessBlockedDuringEpisode = false;
         return true;
       }
     }
@@ -409,6 +411,12 @@ export var TabUnloader = {
       case "memory-pressure":
         if (data == "low-memory" || data == "low-memory-ongoing") {
           this._ensureAdaptiveBaseline(getConfiguredMinInactiveDuration());
+          if (
+            this._freshnessBlockedDuringEpisode &&
+            typeof this._adaptiveMinInactiveDuration == "number"
+          ) {
+            this._relaxAdaptiveThreshold();
+          }
         }
         break;
       case "memory-pressure-stop":
@@ -429,6 +437,7 @@ export var TabUnloader = {
   _resetAdaptiveState() {
     this._pressureEpisodeActive = false;
     this._adaptiveMinInactiveDuration = null;
+    this._freshnessBlockedDuringEpisode = false;
   },
 
   _ensureAdaptiveBaseline(minInactiveDuration) {
@@ -463,6 +472,9 @@ export var TabUnloader = {
 
   _registerFreshnessBlocked(minInactiveDuration) {
     this._ensureAdaptiveBaseline(minInactiveDuration);
+    if (typeof minInactiveDuration == "number") {
+      this._freshnessBlockedDuringEpisode = true;
+    }
     this._relaxAdaptiveThreshold();
   },
 
