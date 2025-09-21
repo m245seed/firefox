@@ -272,6 +272,7 @@ export var SiteDataManager = {
   },
 
   _getAllCookies(entryUpdatedCallback) {
+    let updatedSites = entryUpdatedCallback ? new Set() : null;
     for (let cookie of Services.cookies.cookies) {
       // Group cookies by first party. If a cookie is partitioned the
       // partitionKey will contain the first party site, instead of the host
@@ -287,9 +288,6 @@ export var SiteDataManager = {
       let baseDomainOrHost =
         pkBaseDomain || this.getBaseDomainFromHost(cookie.rawHost);
       let site = this._getOrInsertSite(baseDomainOrHost);
-      if (entryUpdatedCallback) {
-        entryUpdatedCallback(baseDomainOrHost, site);
-      }
       site.cookies.push(cookie);
       if (Number.isInteger(cookie.originAttributes.userContextId)) {
         let containerData = this._getOrInsertContainersData(
@@ -304,6 +302,17 @@ export var SiteDataManager = {
       }
       if (site.lastAccessed < cookie.lastAccessed) {
         site.lastAccessed = cookie.lastAccessed;
+      }
+      if (updatedSites) {
+        updatedSites.add(baseDomainOrHost);
+      }
+    }
+    if (updatedSites) {
+      for (let baseDomainOrHost of updatedSites) {
+        let site = this._sites.get(baseDomainOrHost);
+        if (site) {
+          entryUpdatedCallback(baseDomainOrHost, site);
+        }
       }
     }
   },
