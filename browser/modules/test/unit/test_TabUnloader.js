@@ -407,6 +407,7 @@ let unloadTests = [
 ];
 
 let globalBrowser = {
+  async prepareDiscardBrowser() {},
   discardBrowser() {
     return true;
   },
@@ -445,5 +446,64 @@ add_task(async function doTests() {
     }
 
     Assert.equal(expectedOrder, test.result);
+  }
+});
+
+add_task(async function test_adaptive_min_inactive_duration_unit() {
+  const originalIterateTabs = TestTabUnloaderMethods.iterateTabs;
+  const originalGetNow = TestTabUnloaderMethods.getNow;
+  const originalDiscardBrowser = globalBrowser.discardBrowser;
+
+  try {
+    let now = 1000;
+    TestTabUnloaderMethods.getNow = () => now;
+    TestTabUnloaderMethods.iterateTabs = function* () {
+      yield {
+        tab: {
+          lastAccessed: now - 9,
+          keywords: "",
+          process: "1",
+        },
+        gBrowser: globalBrowser,
+      };
+    };
+
+    let discardCount = 0;
+    globalBrowser.discardBrowser = () => {
+      discardCount++;
+      return true;
+    };
+
+    TabUnloader.observe(null, "memory-pressure-stop");
+
+    let result = await TabUnloader.unloadLeastRecentlyUsedTab(10, {
+      allowAdaptiveMinInactiveDuration: true,
+      tabMethods: TestTabUnloaderMethods,
+    });
+    Assert.ok(!result, "No tab discarded when all tabs are too fresh");
+    Assert.equal(
+      TabUnloader._adaptiveMinInactiveDuration,
+      5,
+      "Inactivity duration is halved after a failed attempt"
+    );
+
+    result = await TabUnloader.unloadLeastRecentlyUsedTab(10, {
+      allowAdaptiveMinInactiveDuration: true,
+      tabMethods: TestTabUnloaderMethods,
+    });
+    Assert.ok(result, "Tab discarded once inactivity window shrinks");
+    Assert.equal(discardCount, 1, "discardBrowser invoked once");
+
+    TabUnloader.observe(null, "memory-pressure-stop");
+    Assert.strictEqual(
+      TabUnloader._adaptiveMinInactiveDuration,
+      null,
+      "Adaptive state reset when memory pressure stops"
+    );
+  } finally {
+    TestTabUnloaderMethods.iterateTabs = originalIterateTabs;
+    TestTabUnloaderMethods.getNow = originalGetNow;
+    globalBrowser.discardBrowser = originalDiscardBrowser;
+    TabUnloader.observe(null, "memory-pressure-stop");
   }
 });

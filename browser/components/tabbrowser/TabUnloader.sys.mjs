@@ -26,8 +26,11 @@ const NEVER_DISCARD = 100000;
 
 // Default minimum inactive duration.  Tabs that were accessed in the last
 // period of this duration are not unloaded.
+const MIN_INACTIVE_DURATION_PREF =
+  "browser.tabs.min_inactive_duration_before_unload";
+
 const kMinInactiveDurationInMs = Services.prefs.getIntPref(
-  "browser.tabs.min_inactive_duration_before_unload"
+  MIN_INACTIVE_DURATION_PREF
 );
 
 let criteriaTypes = [
@@ -159,10 +162,21 @@ let DefaultTabUnloaderMethods = {
  */
 
 export var TabUnloader = {
+  _initialized: false,
+  _underMemoryPressure: false,
+  _adaptiveMinInactiveDuration: null,
+  _lastExcludedFreshTab: false,
+
   /**
    * Initialize low-memory detection and tab auto-unloading.
    */
   init() {
+    if (!this._initialized) {
+      Services.obs.addObserver(this, "memory-pressure");
+      Services.obs.addObserver(this, "memory-pressure-stop");
+      Services.obs.addObserver(this, "xpcom-shutdown");
+      this._initialized = true;
+    }
     const watcher = Cc["@mozilla.org/xpcom/memory-watcher;1"].getService(
       Ci.nsIAvailableMemoryWatcherBase
     );
@@ -176,8 +190,69 @@ export var TabUnloader = {
     return tab.weight < NEVER_DISCARD;
   },
 
+  _getBaseMinInactiveDuration() {
+    return Services.prefs.getIntPref(
+      MIN_INACTIVE_DURATION_PREF,
+      kMinInactiveDurationInMs
+    );
+  },
+
+  _getEffectiveMinInactiveDuration(minInactiveDuration) {
+    if (typeof minInactiveDuration != "number") {
+      return minInactiveDuration;
+    }
+
+    let effectiveValue = minInactiveDuration;
+
+    if (
+      this._underMemoryPressure &&
+      this._adaptiveMinInactiveDuration !== null
+    ) {
+      effectiveValue = Math.min(
+        effectiveValue,
+        this._adaptiveMinInactiveDuration
+      );
+    }
+
+    return Math.max(effectiveValue, 0);
+  },
+
+  _resetAdaptiveState() {
+    this._adaptiveMinInactiveDuration = null;
+    this._underMemoryPressure = false;
+  },
+
+  _maybeRelaxMinInactiveDuration({
+    sortedTabs,
+    minInactiveDuration,
+    allowAdaptive,
+  }) {
+    if (
+      !allowAdaptive ||
+      typeof minInactiveDuration != "number" ||
+      minInactiveDuration <= 0 ||
+      sortedTabs.length ||
+      !this._lastExcludedFreshTab
+    ) {
+      return;
+    }
+
+    this._underMemoryPressure = true;
+
+    const currentValue =
+      this._adaptiveMinInactiveDuration ?? minInactiveDuration;
+    const relaxedValue = Math.max(0, Math.floor(currentValue / 2));
+
+    if (
+      this._adaptiveMinInactiveDuration === null ||
+      relaxedValue < this._adaptiveMinInactiveDuration
+    ) {
+      this._adaptiveMinInactiveDuration = relaxedValue;
+    }
+  },
+
   // This method is exposed on nsITabUnloader
-  async unloadTabAsync(minInactiveDuration = kMinInactiveDurationInMs) {
+  async unloadTabAsync(minInactiveDuration) {
     const watcher = Cc["@mozilla.org/xpcom/memory-watcher;1"].getService(
       Ci.nsIAvailableMemoryWatcherBase
     );
@@ -195,9 +270,19 @@ export var TabUnloader = {
       return;
     }
 
+    const explicitDurationProvided = arguments.length > 0;
+    if (!explicitDurationProvided) {
+      minInactiveDuration = this._getBaseMinInactiveDuration();
+    }
+
     this._isUnloading = true;
-    const isTabUnloaded =
-      await this.unloadLeastRecentlyUsedTab(minInactiveDuration);
+    const isTabUnloaded = await this.unloadLeastRecentlyUsedTab(
+      minInactiveDuration,
+      {
+        allowAdaptiveMinInactiveDuration:
+          !explicitDurationProvided && typeof minInactiveDuration == "number",
+      }
+    );
     this._isUnloading = false;
 
     watcher.onUnloadAttemptCompleted(
@@ -241,6 +326,7 @@ export var TabUnloader = {
     minInactiveDuration = kMinInactiveDurationInMs,
     tabMethods = DefaultTabUnloaderMethods
   ) {
+    this._lastExcludedFreshTab = false;
     let tabs = [];
 
     const now = tabMethods.getNow();
@@ -252,6 +338,7 @@ export var TabUnloader = {
         now - tab.tab.lastAccessed < minInactiveDuration
       ) {
         // Skip "fresh" tabs, which were accessed within the specified duration.
+        this._lastExcludedFreshTab = true;
         continue;
       }
 
@@ -320,15 +407,30 @@ export var TabUnloader = {
    * @returns true if a tab was unloaded, otherwise false.
    */
   async unloadLeastRecentlyUsedTab(
-    minInactiveDuration = kMinInactiveDurationInMs
+    minInactiveDuration,
+    options = {}
   ) {
-    const sortedTabs = await this.getSortedTabs(minInactiveDuration);
+    const {
+      allowAdaptiveMinInactiveDuration = false,
+      tabMethods = DefaultTabUnloaderMethods,
+    } = options;
+
+    if (minInactiveDuration === undefined) {
+      minInactiveDuration = this._getBaseMinInactiveDuration();
+    }
+
+    const effectiveMinInactiveDuration = allowAdaptiveMinInactiveDuration
+      ? this._getEffectiveMinInactiveDuration(minInactiveDuration)
+      : minInactiveDuration;
+
+    const sortedTabs = await this.getSortedTabs(
+      effectiveMinInactiveDuration,
+      tabMethods
+    );
 
     for (let tabInfo of sortedTabs) {
       if (!this.isDiscardable(tabInfo)) {
-        // Since |sortedTabs| is sorted, once we see an undiscardable tab
-        // no need to continue the loop.
-        return false;
+        break;
       }
 
       const remoteType = tabInfo.tab?.linkedBrowser?.remoteType;
@@ -341,6 +443,12 @@ export var TabUnloader = {
         return true;
       }
     }
+
+    this._maybeRelaxMinInactiveDuration({
+      sortedTabs,
+      minInactiveDuration: effectiveMinInactiveDuration,
+      allowAdaptive: allowAdaptiveMinInactiveDuration,
+    });
     return false;
   },
 
@@ -348,6 +456,29 @@ export var TabUnloader = {
     "nsIObserver",
     "nsISupportsWeakReference",
   ]),
+
+  observe(subject, topic, data) {
+    switch (topic) {
+      case "memory-pressure":
+        if (data === "low-memory" || data === "low-memory-ongoing") {
+          if (data === "low-memory" && !this._underMemoryPressure) {
+            this._adaptiveMinInactiveDuration = null;
+          }
+          this._underMemoryPressure = true;
+        }
+        break;
+      case "memory-pressure-stop":
+        this._resetAdaptiveState();
+        break;
+      case "xpcom-shutdown":
+        Services.obs.removeObserver(this, "memory-pressure");
+        Services.obs.removeObserver(this, "memory-pressure-stop");
+        Services.obs.removeObserver(this, "xpcom-shutdown");
+        this._initialized = false;
+        this._resetAdaptiveState();
+        break;
+    }
+  },
 };
 
 /** Determine the base weight of the tab without accounting for

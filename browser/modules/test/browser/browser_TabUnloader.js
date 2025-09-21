@@ -362,6 +362,91 @@ add_task(async function test() {
   await awaitWebRTCClose();
 });
 
+add_task(async function test_adaptive_min_inactive_duration_browser() {
+  TabUnloader.init();
+
+  const prefValue = 2000;
+  await SpecialPowers.pushPrefEnv({
+    set: [["browser.tabs.min_inactive_duration_before_unload", prefValue]],
+  });
+
+  const win = await BrowserTestUtils.openNewBrowserWindow();
+  const { gBrowser: winGBrowser } = win;
+
+  const activeTab = winGBrowser.selectedTab;
+  const candidateTab = BrowserTestUtils.addTab(winGBrowser, "about:blank");
+  await BrowserTestUtils.browserLoaded(
+    winGBrowser.getBrowserForTab(candidateTab)
+  );
+  await BrowserTestUtils.switchTab(winGBrowser, activeTab);
+
+  candidateTab.lastAccessed = Date.now();
+
+  const originalPrepare = winGBrowser.prepareDiscardBrowser;
+  const originalDiscard = winGBrowser.discardBrowser;
+  winGBrowser.prepareDiscardBrowser = async () => {};
+  let discardCount = 0;
+  winGBrowser.discardBrowser = () => {
+    discardCount++;
+    return true;
+  };
+
+  const originalGetSortedTabs = TabUnloader.getSortedTabs;
+  TabUnloader.getSortedTabs = async function (minInactiveDuration) {
+    const age = Date.now() - candidateTab.lastAccessed;
+    const tabs = [];
+    this._lastExcludedFreshTab =
+      typeof minInactiveDuration == "number" && age < minInactiveDuration;
+    if (!this._lastExcludedFreshTab) {
+      tabs.push({
+        tab: candidateTab,
+        gBrowser: winGBrowser,
+        weight: 0,
+      });
+    }
+    return tabs;
+  };
+
+  try {
+    TabUnloader.observe(null, "memory-pressure-stop");
+
+    let result = await TabUnloader.unloadLeastRecentlyUsedTab(undefined, {
+      allowAdaptiveMinInactiveDuration: true,
+    });
+    ok(
+      !result,
+      "Fresh tab is not discarded before relaxing inactivity window"
+    );
+    is(
+      TabUnloader._adaptiveMinInactiveDuration,
+      Math.floor(prefValue / 2),
+      "Adaptive min inactive duration halves after failed attempt"
+    );
+
+    candidateTab.lastAccessed = Date.now() - prefValue;
+
+    result = await TabUnloader.unloadLeastRecentlyUsedTab(undefined, {
+      allowAdaptiveMinInactiveDuration: true,
+    });
+    ok(result, "Tab becomes discardable once inactivity window shrinks");
+    is(discardCount, 1, "discardBrowser called once after adaptation");
+
+    TabUnloader.observe(null, "memory-pressure-stop");
+    is(
+      TabUnloader._adaptiveMinInactiveDuration,
+      null,
+      "Adaptive state reset when memory pressure stops"
+    );
+  } finally {
+    TabUnloader.getSortedTabs = originalGetSortedTabs;
+    winGBrowser.discardBrowser = originalDiscard;
+    winGBrowser.prepareDiscardBrowser = originalPrepare;
+    TabUnloader.observe(null, "memory-pressure-stop");
+    await BrowserTestUtils.closeWindow(win);
+    await SpecialPowers.popPrefEnv();
+  }
+});
+
 // Wait for the WebRTC indicator window to close.
 function awaitWebRTCClose() {
   if (
