@@ -24,11 +24,24 @@ const MIN_TABS_COUNT = 10;
 // Weight for non-discardable tabs.
 const NEVER_DISCARD = 100000;
 
+const PREF_MIN_INACTIVE_DURATION =
+  "browser.tabs.min_inactive_duration_before_unload";
+
 // Default minimum inactive duration.  Tabs that were accessed in the last
 // period of this duration are not unloaded.
-const kMinInactiveDurationInMs = Services.prefs.getIntPref(
-  "browser.tabs.min_inactive_duration_before_unload"
-);
+function getConfiguredMinInactiveDuration() {
+  return Services.prefs.getIntPref(PREF_MIN_INACTIVE_DURATION);
+}
+
+function normalizeMinInactiveDuration(minInactiveDuration) {
+  if (minInactiveDuration === null) {
+    return null;
+  }
+  if (typeof minInactiveDuration == "number") {
+    return minInactiveDuration;
+  }
+  return getConfiguredMinInactiveDuration();
+}
 
 let criteriaTypes = [
   ["isNonDiscardable", NEVER_DISCARD],
@@ -159,6 +172,11 @@ let DefaultTabUnloaderMethods = {
  */
 
 export var TabUnloader = {
+  _isUnloading: false,
+  _pressureEpisodeActive: false,
+  _adaptiveMinInactiveDuration: null,
+  _observersRegistered: false,
+
   /**
    * Initialize low-memory detection and tab auto-unloading.
    */
@@ -167,6 +185,13 @@ export var TabUnloader = {
       Ci.nsIAvailableMemoryWatcherBase
     );
     watcher.registerTabUnloader(this);
+
+    if (!this._observersRegistered) {
+      Services.obs.addObserver(this, "memory-pressure");
+      Services.obs.addObserver(this, "memory-pressure-stop");
+      Services.obs.addObserver(this, "xpcom-shutdown");
+      this._observersRegistered = true;
+    }
   },
 
   isDiscardable(tab) {
@@ -177,7 +202,8 @@ export var TabUnloader = {
   },
 
   // This method is exposed on nsITabUnloader
-  async unloadTabAsync(minInactiveDuration = kMinInactiveDurationInMs) {
+  async unloadTabAsync(minInactiveDuration) {
+    minInactiveDuration = normalizeMinInactiveDuration(minInactiveDuration);
     const watcher = Cc["@mozilla.org/xpcom/memory-watcher;1"].getService(
       Ci.nsIAvailableMemoryWatcherBase
     );
@@ -214,6 +240,7 @@ export var TabUnloader = {
    *        are least-recently-used.
    *
    * @param tabMethods an helper object with methods called by this algorithm.
+   * @param info Optional object that receives metadata about the evaluation.
    *
    * The algorithm used is:
    *   1. Sort all of the tabs by a base weight. Tabs with a higher weight, such as
@@ -238,24 +265,33 @@ export var TabUnloader = {
    * override their behaviour.
    */
   async getSortedTabs(
-    minInactiveDuration = kMinInactiveDurationInMs,
-    tabMethods = DefaultTabUnloaderMethods
+    minInactiveDuration,
+    tabMethods = DefaultTabUnloaderMethods,
+    info = null
   ) {
+    minInactiveDuration = normalizeMinInactiveDuration(minInactiveDuration);
     let tabs = [];
 
     const now = tabMethods.getNow();
 
+    if (info) {
+      info.skippedFreshDiscardable = false;
+    }
+
     let lowestWeight = 1000;
     for (let tab of tabMethods.iterateTabs()) {
+      let weight = determineTabBaseWeight(tab, tabMethods);
+
       if (
         typeof minInactiveDuration == "number" &&
         now - tab.tab.lastAccessed < minInactiveDuration
       ) {
+        if (info && weight != -1 && weight < NEVER_DISCARD) {
+          info.skippedFreshDiscardable = true;
+        }
         // Skip "fresh" tabs, which were accessed within the specified duration.
         continue;
       }
-
-      let weight = determineTabBaseWeight(tab, tabMethods);
 
       // Don't add tabs that have a weight of -1.
       if (weight != -1) {
@@ -318,11 +354,28 @@ export var TabUnloader = {
   /**
    * Select and discard one tab.
    * @returns true if a tab was unloaded, otherwise false.
+   * @param tabMethods Optional helper implementation for testing.
+   * @param stats Optional object that collects metadata about the attempt.
    */
   async unloadLeastRecentlyUsedTab(
-    minInactiveDuration = kMinInactiveDurationInMs
+    minInactiveDuration,
+    tabMethods = DefaultTabUnloaderMethods,
+    stats = null
   ) {
-    const sortedTabs = await this.getSortedTabs(minInactiveDuration);
+    minInactiveDuration = normalizeMinInactiveDuration(minInactiveDuration);
+    let effectiveMinInactiveDuration =
+      typeof minInactiveDuration == "number"
+        ? this._getEffectiveMinInactiveDuration(minInactiveDuration)
+        : minInactiveDuration;
+
+    const info = stats ?? {};
+    info.effectiveMinInactiveDuration = effectiveMinInactiveDuration;
+
+    const sortedTabs = await this.getSortedTabs(
+      effectiveMinInactiveDuration,
+      tabMethods,
+      info
+    );
 
     for (let tabInfo of sortedTabs) {
       if (!this.isDiscardable(tabInfo)) {
@@ -341,7 +394,87 @@ export var TabUnloader = {
         return true;
       }
     }
+    if (
+      info.skippedFreshDiscardable &&
+      typeof minInactiveDuration == "number"
+    ) {
+      this._registerFreshnessBlocked(minInactiveDuration);
+      info.adaptiveMinInactiveDuration = this._adaptiveMinInactiveDuration;
+    }
     return false;
+  },
+
+  observe(subject, topic, data) {
+    switch (topic) {
+      case "memory-pressure":
+        if (data == "low-memory" || data == "low-memory-ongoing") {
+          this._ensureAdaptiveBaseline(getConfiguredMinInactiveDuration());
+        }
+        break;
+      case "memory-pressure-stop":
+        this._resetAdaptiveState();
+        break;
+      case "xpcom-shutdown":
+        if (this._observersRegistered) {
+          Services.obs.removeObserver(this, "memory-pressure");
+          Services.obs.removeObserver(this, "memory-pressure-stop");
+          Services.obs.removeObserver(this, "xpcom-shutdown");
+          this._observersRegistered = false;
+        }
+        this._resetAdaptiveState();
+        break;
+    }
+  },
+
+  _resetAdaptiveState() {
+    this._pressureEpisodeActive = false;
+    this._adaptiveMinInactiveDuration = null;
+  },
+
+  _ensureAdaptiveBaseline(minInactiveDuration) {
+    const baseline = normalizeMinInactiveDuration(minInactiveDuration);
+    if (!this._pressureEpisodeActive) {
+      this._pressureEpisodeActive = true;
+      this._adaptiveMinInactiveDuration = baseline;
+      return;
+    }
+    if (this._adaptiveMinInactiveDuration === null) {
+      this._adaptiveMinInactiveDuration = baseline;
+      return;
+    }
+    if (typeof baseline == "number") {
+      this._adaptiveMinInactiveDuration = Math.min(
+        this._adaptiveMinInactiveDuration,
+        baseline
+      );
+    }
+  },
+
+  _relaxAdaptiveThreshold() {
+    if (typeof this._adaptiveMinInactiveDuration != "number") {
+      this._adaptiveMinInactiveDuration = 0;
+    } else if (this._adaptiveMinInactiveDuration > 0) {
+      this._adaptiveMinInactiveDuration = Math.max(
+        0,
+        Math.floor(this._adaptiveMinInactiveDuration / 2)
+      );
+    }
+  },
+
+  _registerFreshnessBlocked(minInactiveDuration) {
+    this._ensureAdaptiveBaseline(minInactiveDuration);
+    this._relaxAdaptiveThreshold();
+  },
+
+  _getEffectiveMinInactiveDuration(minInactiveDuration) {
+    if (
+      typeof minInactiveDuration != "number" ||
+      !this._pressureEpisodeActive ||
+      this._adaptiveMinInactiveDuration === null
+    ) {
+      return minInactiveDuration;
+    }
+    return Math.min(minInactiveDuration, this._adaptiveMinInactiveDuration);
   },
 
   QueryInterface: ChromeUtils.generateQI([

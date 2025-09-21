@@ -362,6 +362,77 @@ add_task(async function test() {
   await awaitWebRTCClose();
 });
 
+add_task(async function test_adaptive_inactive_duration_integration() {
+  const MIN_PREF = "browser.tabs.min_inactive_duration_before_unload";
+  const prefSet = [
+    [PREF_ENABLE_UNLOADER, true],
+    [MIN_PREF, 4000],
+  ];
+  if (AppConstants.platform == "macosx") {
+    prefSet.push([PREF_MAC_LOW_MEM_RESPONSE, 3]);
+  }
+  await SpecialPowers.pushPrefEnv({ set: prefSet });
+
+  TabUnloader.init();
+  TabUnloader._resetAdaptiveState();
+
+  const originalTab = gBrowser.selectedTab;
+  const firstFreshTab = await addTab();
+  const secondFreshTab = await addTab();
+
+  await BrowserTestUtils.switchTab(gBrowser, originalTab);
+
+  const minInactiveDuration = Services.prefs.getIntPref(MIN_PREF);
+  const now = Date.now();
+  firstFreshTab.lastAccessed = now;
+  secondFreshTab.lastAccessed = now;
+
+  await TabUnloader.unloadTabAsync(minInactiveDuration);
+
+  is(
+    TabUnloader._adaptiveMinInactiveDuration,
+    Math.floor(minInactiveDuration / 2),
+    "Adaptive threshold halves after initial failure"
+  );
+  ok(firstFreshTab.linkedPanel, "First tab remains loaded after first attempt");
+  ok(
+    secondFreshTab.linkedPanel,
+    "Second tab remains loaded after first attempt"
+  );
+
+  const relaxedThreshold = TabUnloader._adaptiveMinInactiveDuration;
+  const olderTimestamp = Date.now() - (relaxedThreshold + 1000);
+  firstFreshTab.lastAccessed = olderTimestamp;
+  secondFreshTab.lastAccessed = Date.now();
+
+  const discarded = BrowserTestUtils.waitForEvent(
+    document,
+    "TabBrowserDiscarded",
+    true
+  );
+  await TabUnloader.unloadTabAsync(minInactiveDuration);
+  await discarded;
+
+  ok(!firstFreshTab.linkedPanel, "First tab discarded after threshold relaxed");
+  is(
+    TabUnloader._adaptiveMinInactiveDuration,
+    relaxedThreshold,
+    "Adaptive threshold remains stable after successful unload"
+  );
+
+  Services.obs.notifyObservers(null, "memory-pressure-stop");
+  is(
+    TabUnloader._adaptiveMinInactiveDuration,
+    null,
+    "Adaptive state resets when pressure stops"
+  );
+
+  BrowserTestUtils.removeTab(firstFreshTab);
+  BrowserTestUtils.removeTab(secondFreshTab);
+  await SpecialPowers.popPrefEnv();
+  TabUnloader._resetAdaptiveState();
+});
+
 // Wait for the WebRTC indicator window to close.
 function awaitWebRTCClose() {
   if (
