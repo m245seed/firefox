@@ -10,6 +10,7 @@ UNIFIED_SOURCES = [
     "TestCmdLineAndEnvUtils.cpp",
     "TestCompatVersionCompare.cpp",
     "TestGeckoArgs.cpp",
+    "TestWebProcessCount.cpp",
 ]
 
 LOCAL_INCLUDES += [

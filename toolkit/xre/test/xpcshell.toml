@@ -14,3 +14,5 @@ support-files = ["show_hash.js"]
 run-sequentially = "Has to launch application binary"
 skip-if = ["os == 'android'"]
 requesttimeoutfactor = 2
+
+["test_dom_ipc_processcount_auto.js"]
