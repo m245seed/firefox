@@ -3402,6 +3402,54 @@
   value: 1000
   mirror: always
 
+# Enable adaptive process prelaunch delay tuning.
+- name: dom.ipc.processPrelaunch.dynamicDelay.enabled
+  type: bool
+  value: true
+  mirror: always
+
+# Minimum adaptive process prelaunch delay in milliseconds.
+- name: dom.ipc.processPrelaunch.dynamicDelay.minMs
+  type: uint32_t
+  value: 250
+  mirror: always
+
+# Maximum adaptive process prelaunch delay in milliseconds.
+- name: dom.ipc.processPrelaunch.dynamicDelay.maxMs
+  type: uint32_t
+  value: 4000
+  mirror: always
+
+# Launch durations under this threshold (in milliseconds) are considered cheap.
+- name: dom.ipc.processPrelaunch.dynamicDelay.cheapLaunchThresholdMs
+  type: uint32_t
+  value: 400
+  mirror: always
+
+# Launch durations above this threshold (in milliseconds) are considered contended.
+- name: dom.ipc.processPrelaunch.dynamicDelay.contentionThresholdMs
+  type: uint32_t
+  value: 1200
+  mirror: always
+
+# Step size (in milliseconds) used when adapting the delay.
+- name: dom.ipc.processPrelaunch.dynamicDelay.adjustmentStepMs
+  type: uint32_t
+  value: 150
+  mirror: always
+
+# How long after a memory pressure event (in milliseconds) we treat launches as contended.
+- name: dom.ipc.processPrelaunch.dynamicDelay.memoryPressureWindowMs
+  type: uint32_t
+  value: 15000
+  mirror: always
+
+# Optionally sample CPU time for completed prelaunches to aid diagnostics.
+- name: dom.ipc.processPrelaunch.dynamicDelay.captureCpuTime
+  type: bool
+  value: false
+  mirror: always
+
 # Process preallocation cache
 # Only used in fission; in e10s we use 1 always
 - name: dom.ipc.processPrelaunch.fission.number

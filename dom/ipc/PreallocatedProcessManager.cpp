@@ -6,10 +6,14 @@
 
 #include "mozilla/PreallocatedProcessManager.h"
 
+#include <algorithm>
+
 #include "ProcessPriorityManager.h"
 #include "mozilla/AppShutdown.h"
 #include "mozilla/ClearOnShutdown.h"
+#include "mozilla/Maybe.h"
 #include "mozilla/Preferences.h"
+#include "mozilla/ProcInfo.h"
 #include "mozilla/ProfilerMarkers.h"
 #include "mozilla/StaticPrefs_dom.h"
 #include "mozilla/Unused.h"
@@ -17,7 +21,10 @@
 #include "mozilla/dom/ScriptSettings.h"
 #include "nsIPropertyBag2.h"
 #include "nsIXULRuntime.h"
+#include "nsMemoryPressure.h"
+#include "nsPrintfCString.h"
 #include "nsServiceManagerUtils.h"
+#include "nsString.h"
 #include "nsTArray.h"
 #include "prsystem.h"
 
@@ -64,6 +71,14 @@ class PreallocatedProcessManagerImpl final : public nsIObserver {
   void AllocateOnIdle();
   void AllocateNow();
 
+  void RegisterLaunchStart(ContentParent* aProcess);
+  void RecordLaunchComplete(ContentParent* aProcess, bool aSucceeded);
+  Maybe<double> SampleCpuTimeMs(ContentParent* aProcess) const;
+  MemoryPressureState GetCurrentMemoryPressureState() const;
+  void UpdateDelayFromPrefs();
+  void UpdateDelayForRecord(double aDurationMs, bool aContended);
+  uint32_t GetScheduleDelayMs() const;
+
   void RereadPrefs();
   void Enable(uint32_t aProcesses);
   void Disable();
@@ -78,10 +93,39 @@ class PreallocatedProcessManagerImpl final : public nsIObserver {
   bool mEnabled;
   uint32_t mNumberPreallocs;
   AutoTArray<UniqueContentParentKeepAlive, 3> mPreallocatedProcesses;
+  struct PendingLaunchInfo {
+    RefPtr<ContentParent> mProcess;
+    TimeStamp mRequested;
+  };
+  AutoTArray<PendingLaunchInfo, 4> mPendingLaunches;
+  struct LaunchRecord {
+    TimeStamp mRequested;
+    TimeStamp mCompleted;
+    Maybe<double> mCpuTimeMs;
+    MemoryPressureState mMemoryPressure = MemoryPressureState::NoPressure;
+    bool mSucceeded = false;
+
+    double DurationMs() const {
+      return (mCompleted - mRequested).ToMilliseconds();
+    }
+  };
+  AutoTArray<LaunchRecord, 8> mRecentLaunches;
   // Even if we have multiple PreallocatedProcessManagerImpls, we'll have
   // one blocker counter
   static uint32_t sNumBlockers;
   TimeStamp mBlockingStartTime;
+  TimeStamp mLastMemoryPressure;
+  uint32_t mBaseDelayMs;
+  uint32_t mCurrentDelayMs;
+  uint32_t mMinDelayMs;
+  uint32_t mMaxDelayMs;
+  uint32_t mCheapLaunchThresholdMs;
+  uint32_t mContentionThresholdMs;
+  uint32_t mAdjustmentStepMs;
+  uint32_t mMemoryPressureWindowMs;
+  uint32_t mCheapLaunchStreak;
+  bool mDynamicDelayEnabled;
+  bool mCaptureCpuTime;
 };
 
 /* static */
@@ -112,7 +156,20 @@ PreallocatedProcessManagerImpl* PreallocatedProcessManagerImpl::Singleton() {
 NS_IMPL_ISUPPORTS(PreallocatedProcessManagerImpl, nsIObserver)
 
 PreallocatedProcessManagerImpl::PreallocatedProcessManagerImpl()
-    : mEnabled(false), mNumberPreallocs(1) {}
+    : mEnabled(false),
+      mNumberPreallocs(1),
+      mLastMemoryPressure(),
+      mBaseDelayMs(StaticPrefs::dom_ipc_processPrelaunch_delayMs()),
+      mCurrentDelayMs(mBaseDelayMs),
+      mMinDelayMs(StaticPrefs::dom_ipc_processPrelaunch_delayMs()),
+      mMaxDelayMs(StaticPrefs::dom_ipc_processPrelaunch_delayMs()),
+      mCheapLaunchThresholdMs(StaticPrefs::dom_ipc_processPrelaunch_delayMs()),
+      mContentionThresholdMs(StaticPrefs::dom_ipc_processPrelaunch_delayMs()),
+      mAdjustmentStepMs(1),
+      mMemoryPressureWindowMs(0),
+      mCheapLaunchStreak(0),
+      mDynamicDelayEnabled(false),
+      mCaptureCpuTime(false) {}
 
 PreallocatedProcessManagerImpl::~PreallocatedProcessManagerImpl() {
   // Note: mPreallocatedProcesses may not be null, but all processes should
@@ -135,6 +192,7 @@ void PreallocatedProcessManagerImpl::Init() {
   for (auto topic : kObserverTopics) {
     os->AddObserver(this, topic, /* ownsWeak */ false);
   }
+  UpdateDelayFromPrefs();
   RereadPrefs();
 }
 
@@ -158,6 +216,7 @@ PreallocatedProcessManagerImpl::Observe(nsISupports* aSubject,
       os->RemoveObserver(this, topic);
     }
   } else if (!strcmp("memory-pressure", aTopic)) {
+    mLastMemoryPressure = TimeStamp::Now();
     CloseProcesses();
   } else {
     MOZ_ASSERT_UNREACHABLE("Unknown topic");
@@ -181,6 +240,7 @@ void PreallocatedProcessManagerImpl::RereadPrefs() {
       }
     }
     if (number >= 0) {
+      UpdateDelayFromPrefs();
       Enable(number);
       // We have one prealloc queue for all types except File now
       if (static_cast<uint64_t>(number) < mPreallocatedProcesses.Length()) {
@@ -281,9 +341,10 @@ void PreallocatedProcessManagerImpl::AllocateAfterDelay() {
   if (!IsEnabled()) {
     return;
   }
-  long delay = StaticPrefs::dom_ipc_processPrelaunch_delayMs();
+  uint32_t delay = GetScheduleDelayMs();
   MOZ_LOG(ContentParent::GetLog(), LogLevel::Debug,
-          ("Starting delayed process start, delay=%ld", delay));
+          ("Starting delayed process start, delay=%u (dynamic=%s)", delay,
+           mDynamicDelayEnabled ? "on" : "off"));
   NS_DelayedDispatchToCurrentThread(
       NewRunnableMethod("PreallocatedProcessManagerImpl::AllocateOnIdle", this,
                         &PreallocatedProcessManagerImpl::AllocateOnIdle),
@@ -323,12 +384,15 @@ void PreallocatedProcessManagerImpl::AllocateNow() {
     return;
   }
 
+  RegisterLaunchStart(process.get());
   process->WaitForLaunchAsync(PROCESS_PRIORITY_PREALLOC)
       ->Then(
           GetCurrentSerialEventTarget(), __func__,
           [self = RefPtr{this},
            process = RefPtr{process.get()}](UniqueContentParentKeepAlive&&) {
-            if (process->IsDead()) {
+            const bool success = !process->IsDead();
+            self->RecordLaunchComplete(process, success);
+            if (!success) {
               self->Erase(process);
               // Process died in startup (before we could add it).  If it
               // dies after this, MarkAsDead() will Erase() this entry.
@@ -346,6 +410,7 @@ void PreallocatedProcessManagerImpl::AllocateNow() {
             }
           },
           [self = RefPtr{this}, process = RefPtr{process.get()}]() {
+            self->RecordLaunchComplete(process, /* aSucceeded */ false);
             self->Erase(process);
           });
 
@@ -361,6 +426,10 @@ void PreallocatedProcessManagerImpl::Disable() {
   }
 
   mEnabled = false;
+  mPendingLaunches.Clear();
+  mRecentLaunches.Clear();
+  mCheapLaunchStreak = 0;
+  mCurrentDelayMs = mBaseDelayMs;
   CloseProcesses();
 }
 
@@ -368,6 +437,219 @@ void PreallocatedProcessManagerImpl::CloseProcesses() {
   // Drop our KeepAlives on these processes. This will automatically lead to the
   // processes being shut down when no keepalives are left.
   mPreallocatedProcesses.Clear();
+}
+
+void PreallocatedProcessManagerImpl::RegisterLaunchStart(
+    ContentParent* aProcess) {
+  if (!aProcess) {
+    return;
+  }
+
+  PendingLaunchInfo info;
+  info.mProcess = aProcess;
+  info.mRequested = TimeStamp::Now();
+  mPendingLaunches.AppendElement(std::move(info));
+}
+
+void PreallocatedProcessManagerImpl::RecordLaunchComplete(
+    ContentParent* aProcess, bool aSucceeded) {
+  if (!aProcess) {
+    return;
+  }
+
+  TimeStamp completed = TimeStamp::Now();
+  Maybe<PendingLaunchInfo> pending;
+  for (size_t index = 0; index < mPendingLaunches.Length(); ++index) {
+    if (mPendingLaunches[index].mProcess == aProcess) {
+      pending.emplace(std::move(mPendingLaunches[index]));
+      mPendingLaunches.RemoveElementAt(index);
+      break;
+    }
+  }
+
+  LaunchRecord record;
+  record.mSucceeded = aSucceeded;
+  record.mCompleted = completed;
+  record.mMemoryPressure = GetCurrentMemoryPressureState();
+  if (pending) {
+    record.mRequested = pending->mRequested;
+  } else {
+    record.mRequested = completed;
+  }
+
+  if (mCaptureCpuTime && aSucceeded) {
+    record.mCpuTimeMs = SampleCpuTimeMs(aProcess);
+  }
+
+  if (mRecentLaunches.Length() == mRecentLaunches.Capacity()) {
+    mRecentLaunches.RemoveElementAt(0);
+  }
+  mRecentLaunches.AppendElement(record);
+
+  double durationMs = record.DurationMs();
+  bool contended =
+      !aSucceeded || record.mMemoryPressure == MemoryPressureState::LowMemory;
+  if (record.mCpuTimeMs && *record.mCpuTimeMs >= mContentionThresholdMs) {
+    contended = true;
+  }
+  UpdateDelayForRecord(durationMs, contended);
+
+  nsAutoCString cpuString;
+  if (record.mCpuTimeMs) {
+    cpuString = nsPrintfCString("%.2f", *record.mCpuTimeMs);
+  } else {
+    cpuString.AssignLiteral("n/a");
+  }
+
+  MOZ_LOG(ContentParent::GetLog(), LogLevel::Debug,
+          ("Prealloc launch %s in %.2fms delay=%u cpu=%s memory=%u",
+           aSucceeded ? "completed" : "failed", durationMs, mCurrentDelayMs,
+           cpuString.get(), static_cast<unsigned>(record.mMemoryPressure)));
+}
+
+Maybe<double> PreallocatedProcessManagerImpl::SampleCpuTimeMs(
+    ContentParent* aProcess) const {
+  if (!mCaptureCpuTime || !aProcess) {
+    return Nothing();
+  }
+
+  nsTArray<mozilla::WindowInfo> windows;
+  nsTArray<mozilla::UtilityInfo> utilities;
+  nsTArray<mozilla::ProcInfoRequest> requests;
+  requests.EmplaceBack(aProcess->OtherPid(), mozilla::ProcType::Preallocated,
+                       EmptyCString(), std::move(windows),
+                       std::move(utilities));
+
+  auto result = mozilla::GetProcInfoSync(std::move(requests));
+  if (!result.IsResolve()) {
+    return Nothing();
+  }
+
+  const auto& map = result.ResolveValue();
+  if (const auto entry = map.lookup(aProcess->OtherPid())) {
+    const mozilla::ProcInfo& info = entry->value();
+    return Some(static_cast<double>(info.cpuTime) / 1000000.0);
+  }
+  return Nothing();
+}
+
+MemoryPressureState
+PreallocatedProcessManagerImpl::GetCurrentMemoryPressureState() const {
+  if (mMemoryPressureWindowMs == 0 || mLastMemoryPressure.IsNull()) {
+    return MemoryPressureState::NoPressure;
+  }
+
+  TimeDuration since = TimeStamp::Now() - mLastMemoryPressure;
+  if (since.ToMilliseconds() <= mMemoryPressureWindowMs) {
+    return MemoryPressureState::LowMemory;
+  }
+  return MemoryPressureState::NoPressure;
+}
+
+void PreallocatedProcessManagerImpl::UpdateDelayFromPrefs() {
+  mBaseDelayMs = StaticPrefs::dom_ipc_processPrelaunch_delayMs();
+  mDynamicDelayEnabled =
+      StaticPrefs::dom_ipc_processPrelaunch_dynamicDelay_enabled();
+  mMinDelayMs = StaticPrefs::dom_ipc_processPrelaunch_dynamicDelay_minMs();
+  mMaxDelayMs = StaticPrefs::dom_ipc_processPrelaunch_dynamicDelay_maxMs();
+  if (mMaxDelayMs < mMinDelayMs) {
+    mMaxDelayMs = mMinDelayMs;
+  }
+  mCheapLaunchThresholdMs = StaticPrefs::
+      dom_ipc_processPrelaunch_dynamicDelay_cheapLaunchThresholdMs();
+  mContentionThresholdMs = StaticPrefs::
+      dom_ipc_processPrelaunch_dynamicDelay_contentionThresholdMs();
+  if (mContentionThresholdMs < mCheapLaunchThresholdMs) {
+    mContentionThresholdMs = mCheapLaunchThresholdMs;
+  }
+  mAdjustmentStepMs = std::max<uint32_t>(
+      1, StaticPrefs::dom_ipc_processPrelaunch_dynamicDelay_adjustmentStepMs());
+  mMemoryPressureWindowMs = StaticPrefs::
+      dom_ipc_processPrelaunch_dynamicDelay_memoryPressureWindowMs();
+  mCaptureCpuTime =
+      StaticPrefs::dom_ipc_processPrelaunch_dynamicDelay_captureCpuTime();
+
+  if (!mDynamicDelayEnabled) {
+    mCurrentDelayMs = mBaseDelayMs;
+  } else {
+    if (mCurrentDelayMs == 0) {
+      mCurrentDelayMs = mBaseDelayMs;
+    }
+    mCurrentDelayMs =
+        std::max(mMinDelayMs, std::min(mCurrentDelayMs, mMaxDelayMs));
+  }
+}
+
+void PreallocatedProcessManagerImpl::UpdateDelayForRecord(double aDurationMs,
+                                                          bool aContended) {
+  if (!mDynamicDelayEnabled) {
+    return;
+  }
+
+  bool contended = aContended || aDurationMs >= mContentionThresholdMs;
+  if (contended) {
+    mCheapLaunchStreak = 0;
+    uint32_t newDelay =
+        std::min(mMaxDelayMs, mCurrentDelayMs + mAdjustmentStepMs);
+    if (newDelay != mCurrentDelayMs) {
+      MOZ_LOG(ContentParent::GetLog(), LogLevel::Debug,
+              ("Contended prelaunch (%.2fms) increasing delay %u -> %u",
+               aDurationMs, mCurrentDelayMs, newDelay));
+    }
+    mCurrentDelayMs = newDelay;
+    return;
+  }
+
+  bool cheap = aDurationMs <= mCheapLaunchThresholdMs;
+  if (cheap) {
+    if (mCurrentDelayMs > mMinDelayMs) {
+      ++mCheapLaunchStreak;
+      if (mCheapLaunchStreak >= 2) {
+        uint32_t newDelay =
+            std::max(mMinDelayMs, mCurrentDelayMs - mAdjustmentStepMs);
+        if (newDelay != mCurrentDelayMs) {
+          MOZ_LOG(ContentParent::GetLog(), LogLevel::Debug,
+                  ("Cheap prelaunch (%.2fms) decreasing delay %u -> %u",
+                   aDurationMs, mCurrentDelayMs, newDelay));
+        }
+        mCurrentDelayMs = newDelay;
+        mCheapLaunchStreak = 0;
+      }
+    }
+    return;
+  }
+
+  mCheapLaunchStreak = 0;
+  if (mCurrentDelayMs > mBaseDelayMs) {
+    uint32_t delta = std::max<uint32_t>(1, mAdjustmentStepMs / 2);
+    uint32_t newDelay = std::max(mMinDelayMs, mCurrentDelayMs - delta);
+    if (newDelay != mCurrentDelayMs) {
+      MOZ_LOG(ContentParent::GetLog(), LogLevel::Debug,
+              ("Relaxing delay downward %u -> %u toward base %u",
+               mCurrentDelayMs, newDelay, mBaseDelayMs));
+    }
+    mCurrentDelayMs = newDelay;
+  } else if (mCurrentDelayMs < mBaseDelayMs) {
+    uint32_t delta = std::max<uint32_t>(1, mAdjustmentStepMs / 2);
+    uint32_t newDelay = std::min(mMaxDelayMs, mCurrentDelayMs + delta);
+    uint32_t clamped = std::min(mBaseDelayMs, newDelay);
+    if (clamped != mCurrentDelayMs) {
+      MOZ_LOG(ContentParent::GetLog(), LogLevel::Debug,
+              ("Relaxing delay upward %u -> %u toward base %u", mCurrentDelayMs,
+               clamped, mBaseDelayMs));
+    }
+    mCurrentDelayMs = clamped;
+  }
+}
+
+uint32_t PreallocatedProcessManagerImpl::GetScheduleDelayMs() const {
+  if (!mDynamicDelayEnabled) {
+    return StaticPrefs::dom_ipc_processPrelaunch_delayMs();
+  }
+
+  uint32_t delay = mCurrentDelayMs ? mCurrentDelayMs : mBaseDelayMs;
+  delay = std::max(mMinDelayMs, std::min(delay, mMaxDelayMs));
+  return delay;
 }
 
 inline PreallocatedProcessManagerImpl*
