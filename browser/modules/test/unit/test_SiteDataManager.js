@@ -125,6 +125,66 @@ add_task(async function testGetSites() {
   await SiteDataTestUtils.clear();
 });
 
+add_task(async function testCookieCallbacksAreBatchedPerDomain() {
+  await SiteDataTestUtils.clear();
+
+  SiteDataTestUtils.addToCookies({
+    origin: EXAMPLE_ORIGIN,
+    name: "batched1",
+    value: "value1",
+  });
+  SiteDataTestUtils.addToCookies({
+    origin: EXAMPLE_ORIGIN,
+    name: "batched2",
+    value: "value2",
+  });
+  SiteDataTestUtils.addToCookies({
+    origin: EXAMPLE_ORIGIN_2,
+    name: "batched3",
+    value: "value3",
+  });
+
+  let callbackCalls = [];
+  await SiteDataManager.updateSites((baseDomain, site) => {
+    if (baseDomain == "example.com" || baseDomain == "example.org") {
+      callbackCalls.push({
+        baseDomain,
+        cookieCount: site.cookies.length,
+      });
+    }
+  });
+
+  let exampleComCalls = callbackCalls.filter(
+    ({ baseDomain }) => baseDomain == "example.com"
+  );
+  Assert.equal(
+    exampleComCalls.length,
+    1,
+    "example.com should trigger the callback once"
+  );
+  Assert.equal(
+    exampleComCalls[0].cookieCount,
+    2,
+    "example.com callback should see both cookies"
+  );
+
+  let exampleOrgCalls = callbackCalls.filter(
+    ({ baseDomain }) => baseDomain == "example.org"
+  );
+  Assert.equal(
+    exampleOrgCalls.length,
+    1,
+    "example.org should trigger the callback once"
+  );
+  Assert.equal(
+    exampleOrgCalls[0].cookieCount,
+    1,
+    "example.org callback should see its single cookie"
+  );
+
+  await SiteDataTestUtils.clear();
+});
+
 add_task(async function testGetTotalUsage() {
   await SiteDataManager.updateSites();
   let sites = await SiteDataManager.getSites();
