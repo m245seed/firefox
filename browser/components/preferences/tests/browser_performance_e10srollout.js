@@ -5,6 +5,21 @@ const DEFAULT_PROCESS_COUNT = Services.prefs
   .getDefaultBranch(null)
   .getIntPref("dom.ipc.processCount");
 
+function getCustomProcessCount(defaultCount) {
+  if (defaultCount === 0) {
+    return 4;
+  }
+  if (defaultCount > 2) {
+    return defaultCount - 2;
+  }
+  if (defaultCount < 8) {
+    return defaultCount + 1;
+  }
+  return 8;
+}
+
+const CUSTOM_PROCESS_COUNT = getCustomProcessCount(DEFAULT_PROCESS_COUNT);
+
 add_task(async function () {
   // We must temporarily disable `Once` StaticPrefs check for the duration of
   // this test (see bug 1556131). We must do so in a separate operation as
@@ -98,9 +113,7 @@ add_task(async function testPrefsAreDefault() {
 });
 
 add_task(async function testPrefsSetByUser() {
-  const kNewCount = DEFAULT_PROCESS_COUNT - 2;
-
-  Services.prefs.setIntPref("dom.ipc.processCount", kNewCount);
+  Services.prefs.setIntPref("dom.ipc.processCount", CUSTOM_PROCESS_COUNT);
   Services.prefs.setBoolPref(
     "browser.preferences.defaultPerformanceSettings.enabled",
     false
@@ -127,12 +140,12 @@ add_task(async function testPrefsSetByUser() {
   );
   is(
     Services.prefs.getIntPref("dom.ipc.processCount"),
-    kNewCount,
+    CUSTOM_PROCESS_COUNT,
     "process count should be the set value"
   );
   is(
     contentProcessCount.selectedItem.value,
-    "" + kNewCount,
+    "" + CUSTOM_PROCESS_COUNT,
     "selected item should be the set one"
   );
 

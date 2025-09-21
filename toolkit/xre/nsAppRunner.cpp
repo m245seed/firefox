@@ -8,6 +8,7 @@
 #include "mozilla/ipc/GeckoChildProcessHost.h"
 
 #include "mozilla/AppShutdown.h"
+#include "mozilla/Atomics.h"
 #include "mozilla/ArrayUtils.h"
 #include "mozilla/Assertions.h"
 #include "mozilla/Attributes.h"
@@ -46,6 +47,7 @@
 #include "mozJSModuleLoader.h"
 
 #include "nsAppRunner.h"
+#include "nsThreadUtils.h"
 #include "mozilla/XREAppData.h"
 #include "mozilla/Bootstrap.h"
 #if defined(MOZ_UPDATER) && !defined(MOZ_WIDGET_ANDROID)
@@ -69,6 +71,7 @@
 #include "prprf.h"
 #include "prproces.h"
 #include "prenv.h"
+#include "prsystem.h"
 #include "prtime.h"
 
 #include "nsIAppStartup.h"
@@ -179,6 +182,7 @@
 #include "mozilla/LateWriteChecks.h"
 
 #include <stdlib.h>
+#include <algorithm>
 #include <locale.h>
 
 #ifdef XP_UNIX
@@ -194,7 +198,6 @@
 #  include <process.h>
 #  include <shlobj.h>
 #  include "mozilla/WinDllServices.h"
-#  include "nsThreadUtils.h"
 #  include "WinUtils.h"
 #endif
 
@@ -6347,7 +6350,82 @@ bool XRE_UseNativeEventProcessing() {
   }
 }
 
+namespace {
+
+constexpr uint32_t kMinWebProcessCount = 1;
+constexpr uint32_t kMaxWebProcessCount = 32;
+constexpr uint64_t kBytesPerWebProcess = 2ULL << 30;
+
+mozilla::Atomic<size_t> sProcessCountCpuOverride{0};
+mozilla::Atomic<uint64_t> sProcessCountMemoryOverride{0};
+
+size_t GetCpuCountForMaxWebProcessCount() {
+  size_t override = sProcessCountCpuOverride;
+  if (override) {
+    return override;
+  }
+
+  size_t cpuCount = mozilla::GetNumberOfProcessors();
+  return std::max<size_t>(cpuCount, static_cast<size_t>(1));
+}
+
+uint64_t GetTotalMemoryForMaxWebProcessCount() {
+  uint64_t override = sProcessCountMemoryOverride;
+  if (override) {
+    return override;
+  }
+
+  return PR_GetPhysicalMemorySize();
+}
+
+uint32_t ComputeAutoWebProcessCount() {
+  const size_t cpuCount = GetCpuCountForMaxWebProcessCount();
+  const uint32_t cpuBased = static_cast<uint32_t>(std::min<size_t>(
+      cpuCount, static_cast<size_t>(kMaxWebProcessCount)));
+
+  const uint64_t totalMemory = GetTotalMemoryForMaxWebProcessCount();
+  uint32_t memoryBased = kMaxWebProcessCount;
+  if (totalMemory) {
+    uint64_t processesByMemory = totalMemory / kBytesPerWebProcess;
+    if (processesByMemory < kMinWebProcessCount) {
+      processesByMemory = kMinWebProcessCount;
+    } else if (processesByMemory > kMaxWebProcessCount) {
+      processesByMemory = kMaxWebProcessCount;
+    }
+    memoryBased = static_cast<uint32_t>(processesByMemory);
+  }
+
+  uint32_t autoValue =
+      std::max(kMinWebProcessCount, std::min(cpuBased, memoryBased));
+
+#if defined(MOZ_ASAN) || defined(MOZ_TSAN)
+  constexpr uint32_t kSanitizerMaxProcessCount = 4;
+  if (autoValue > kSanitizerMaxProcessCount) {
+    autoValue = kSanitizerMaxProcessCount;
+  }
+#endif
+
+  return autoValue;
+}
+
+}  // namespace
+
 namespace mozilla {
+
+namespace detail {
+
+void SetProcessCountTestOverrides(size_t aCpuCountOverride,
+                                  uint64_t aTotalMemoryOverride) {
+  sProcessCountCpuOverride = aCpuCountOverride;
+  sProcessCountMemoryOverride = aTotalMemoryOverride;
+}
+
+void ClearProcessCountTestOverrides() {
+  sProcessCountCpuOverride = 0;
+  sProcessCountMemoryOverride = 0;
+}
+
+}  // namespace detail
 
 uint32_t GetMaxWebProcessCount() {
   // multiOptOut is in int to allow us to run multiple experiments without
@@ -6358,13 +6436,30 @@ uint32_t GetMaxWebProcessCount() {
   }
 
   const char* optInPref = "dom.ipc.processCount";
-  uint32_t optInPrefValue = Preferences::GetInt(optInPref, 1);
-  return std::max(1u, optInPrefValue);
+  int32_t optInPrefValue = Preferences::GetInt(optInPref, 0);
+  if (optInPrefValue > 0) {
+    return static_cast<uint32_t>(optInPrefValue);
+  }
+
+  return ComputeAutoWebProcessCount();
 }
 
 const char* PlatformBuildID() { return gToolkitBuildID; }
 
 }  // namespace mozilla
+
+extern "C" {
+
+void XRE_SetProcessCountTestOverride(size_t aCpuCount,
+                                     uint64_t aTotalMemory) {
+  mozilla::detail::SetProcessCountTestOverrides(aCpuCount, aTotalMemory);
+}
+
+void XRE_ClearProcessCountTestOverride() {
+  mozilla::detail::ClearProcessCountTestOverrides();
+}
+
+}  // extern "C"
 
 void SetupErrorHandling(const char* progname) {
 #ifdef XP_WIN

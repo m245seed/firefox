@@ -176,7 +176,7 @@ Shared Web Content
 """"""""""""""""""
 
 :remoteType: ``web``
-:default count: 8 (``dom.ipc.processCount``)
+:default count: Automatic (``dom.ipc.processCount``)
 
 The shared web content process is used to host content which is not isolated into one of the other web content process types. This includes almost all web content with Fission disabled, and web content which cannot be attributed to a specific origin with Fission enabled, such as user-initiated ``data:`` URI loads.
 

@@ -1873,9 +1873,10 @@ pref("dom.use_watchdog", true);
 // Stop all scripts in a compartment when the "stop script" dialog is used.
 pref("dom.global_stop_script", true);
 
-// Enable multi by default.
+// Enable multi by default. Use a sentinel of 0 to indicate the value should be
+// computed automatically at runtime based on the hardware.
 #if !defined(MOZ_ASAN) && !defined(MOZ_TSAN)
-  pref("dom.ipc.processCount", 8);
+  pref("dom.ipc.processCount", 0);
 #elif defined(FUZZING_SNAPSHOT)
   pref("dom.ipc.processCount", 1);
 #else

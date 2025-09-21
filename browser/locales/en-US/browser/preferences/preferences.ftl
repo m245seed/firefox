@@ -577,11 +577,17 @@ performance-limit-content-process-option = Content process limit
 
 performance-limit-content-process-enabled-desc = Additional content processes can improve performance when using multiple tabs, but will also use more memory.
 performance-limit-content-process-blocked-desc = Modifying the number of content processes is only possible with multiprocess { -brand-short-name }. <a data-l10n-name="learn-more">Learn how to check if multiprocess is enabled</a>
+performance-limit-content-process-automatic =
+    .label = Automatic
 
 # Variables:
 #   $num (number) - Default value of the `dom.ipc.processCount` pref.
 performance-default-content-process-count =
-    .label = { $num } (default)
+    .label =
+        { $num ->
+            [0] Automatic (default)
+           *[other] { $num } (default)
+        }
 
 ## General Section - Browsing
 
