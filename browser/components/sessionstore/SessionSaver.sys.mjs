@@ -43,6 +43,7 @@ ChromeUtils.defineESModuleGetters(lazy, {
 const PREF_INTERVAL_ACTIVE = "browser.sessionstore.interval";
 const PREF_INTERVAL_IDLE = "browser.sessionstore.interval.idle";
 const PREF_IDLE_DELAY = "browser.sessionstore.idleDelay";
+const PREF_ASYNC_SAVE_CHUNK = "browser.sessionstore.saver.asyncWindowChunk";
 
 // Notify observers about a given topic with a given subject.
 function notify(subject, topic) {
@@ -246,7 +247,7 @@ var SessionSaverInternal = {
    *        Forces us to recollect data for all windows and will bypass and
    *        update the corresponding caches.
    */
-  _saveState(forceUpdateAllWindows = false) {
+  async _saveState(forceUpdateAllWindows = false, options = {}) {
     // Cancel any pending timeouts.
     this.cancel();
 
@@ -259,7 +260,17 @@ var SessionSaverInternal = {
     }
 
     let timerId = Glean.sessionRestore.collectData.start();
-    let state = lazy.SessionStore.getCurrentState(forceUpdateAllWindows);
+    let state;
+    if (options.collectOptions) {
+      state = await lazy.SessionStore.getCurrentStateAsync(
+        forceUpdateAllWindows,
+        options.collectOptions
+      );
+    } else {
+      state = await Promise.resolve(
+        lazy.SessionStore.getCurrentState(forceUpdateAllWindows)
+      );
+    }
     lazy.PrivacyFilter.filterPrivateWindowsAndTabs(state);
 
     // Make sure we only write worth saving tabs to disk.
@@ -351,7 +362,13 @@ var SessionSaverInternal = {
     this._timeoutID = null;
 
     // Write to disk.
-    this._saveState();
+    let chunkSize = Services.prefs.getIntPref(
+      PREF_ASYNC_SAVE_CHUNK,
+      1
+    );
+    return this._saveState(false, {
+      collectOptions: { chunkSize },
+    });
   },
 
   /**
