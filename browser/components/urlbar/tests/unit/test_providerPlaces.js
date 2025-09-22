@@ -64,6 +64,7 @@ add_task(async function test_places() {
     tabGroupId,
     false
   );
+  await UrlbarProviderOpenTabs.flushPendingMemoryTableUpdatesForTests();
   await PlacesFrecencyRecalculator.recalculateAnyOutdatedFrecencies();
 
   await controller.startQuery(context);

@@ -350,6 +350,7 @@ async function addOpenPages(
       false
     );
   }
+  await UrlbarProviderOpenTabs.flushPendingMemoryTableUpdatesForTests();
 }
 
 async function removeOpenPages(
@@ -366,6 +367,7 @@ async function removeOpenPages(
       false
     );
   }
+  await UrlbarProviderOpenTabs.flushPendingMemoryTableUpdatesForTests();
 }
 
 /**
