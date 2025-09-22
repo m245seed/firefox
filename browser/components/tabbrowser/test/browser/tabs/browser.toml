@@ -575,6 +575,8 @@ tags = "vertical-tabs"
 ["browser_tab_preview.js"]
 tags = "vertical-tabs"
 
+["browser_tab_sizing_unlock_tracked.js"]
+
 ["browser_tab_splitview.js"]
 
 ["browser_tab_tooltips.js"]
@@ -590,6 +592,8 @@ tags = "vertical-tabs"
 
 ["browser_tabkeynavigation.js"]
 tags = "vertical-tabs"
+
+["browser_tabs_audio_labels_cache.js"]
 
 ["browser_tabs_close_beforeunload.js"]
 support-files = [
