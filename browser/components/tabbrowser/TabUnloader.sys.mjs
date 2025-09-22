@@ -43,6 +43,14 @@ function normalizeMinInactiveDuration(minInactiveDuration) {
   return getConfiguredMinInactiveDuration();
 }
 
+let gProcInfoCache = { ts: 0, info: null, episodeId: 0 };
+
+function invalidateProcInfoCache(episodeId = gProcInfoCache.episodeId) {
+  gProcInfoCache.ts = 0;
+  gProcInfoCache.info = null;
+  gProcInfoCache.episodeId = episodeId;
+}
+
 let criteriaTypes = [
   ["isNonDiscardable", NEVER_DISCARD],
   ["isLoading", 8],
@@ -153,7 +161,25 @@ let DefaultTabUnloaderMethods = {
    * @param map of processes returned by getAllProcesses.
    */
   async calculateMemoryUsage(processMap) {
-    let parentProcessInfo = await ChromeUtils.requestProcInfo();
+    const now = Date.now();
+    const episodeId = TabUnloader._pressureEpisodeActive
+      ? TabUnloader._procInfoEpisodeId
+      : 0;
+
+    let parentProcessInfo;
+    if (
+      gProcInfoCache.info &&
+      now - gProcInfoCache.ts < 250 &&
+      gProcInfoCache.episodeId === episodeId
+    ) {
+      parentProcessInfo = gProcInfoCache.info;
+    } else {
+      parentProcessInfo = await ChromeUtils.requestProcInfo();
+      gProcInfoCache.info = parentProcessInfo;
+      gProcInfoCache.ts = now;
+      gProcInfoCache.episodeId = episodeId;
+    }
+
     let childProcessInfoList = parentProcessInfo.children;
     for (let childProcInfo of childProcessInfoList) {
       let processInfo = processMap.get(childProcInfo.pid);
@@ -177,6 +203,7 @@ export var TabUnloader = {
   _adaptiveMinInactiveDuration: null,
   _freshnessBlockedDuringEpisode: false,
   _observersRegistered: false,
+  _procInfoEpisodeId: 0,
 
   /**
    * Initialize low-memory detection and tab auto-unloading.
@@ -190,6 +217,8 @@ export var TabUnloader = {
     if (!this._observersRegistered) {
       Services.obs.addObserver(this, "memory-pressure");
       Services.obs.addObserver(this, "memory-pressure-stop");
+      Services.obs.addObserver(this, "ipc:content-created");
+      Services.obs.addObserver(this, "ipc:content-shutdown");
       Services.obs.addObserver(this, "xpcom-shutdown");
       this._observersRegistered = true;
     }
@@ -435,10 +464,16 @@ export var TabUnloader = {
       case "memory-pressure-stop":
         this._resetAdaptiveState();
         break;
+      case "ipc:content-created":
+      case "ipc:content-shutdown":
+        invalidateProcInfoCache(this._pressureEpisodeActive ? this._procInfoEpisodeId : 0);
+        break;
       case "xpcom-shutdown":
         if (this._observersRegistered) {
           Services.obs.removeObserver(this, "memory-pressure");
           Services.obs.removeObserver(this, "memory-pressure-stop");
+          Services.obs.removeObserver(this, "ipc:content-created");
+          Services.obs.removeObserver(this, "ipc:content-shutdown");
           Services.obs.removeObserver(this, "xpcom-shutdown");
           this._observersRegistered = false;
         }
@@ -451,12 +486,16 @@ export var TabUnloader = {
     this._pressureEpisodeActive = false;
     this._adaptiveMinInactiveDuration = null;
     this._freshnessBlockedDuringEpisode = false;
+    this._procInfoEpisodeId = 0;
+    invalidateProcInfoCache(0);
   },
 
   _ensureAdaptiveBaseline(minInactiveDuration) {
     const baseline = normalizeMinInactiveDuration(minInactiveDuration);
     if (!this._pressureEpisodeActive) {
       this._pressureEpisodeActive = true;
+      this._procInfoEpisodeId++;
+      invalidateProcInfoCache(this._procInfoEpisodeId);
       this._adaptiveMinInactiveDuration = baseline;
       return;
     }
@@ -609,65 +648,113 @@ function getAllProcesses(tabs, tabMethods) {
  * @param processMap map of processes returned by getAllProcesses
  * @param tabMethods an helper object with methods called by this algorithm.
  */
+function buildTabResourceRecord(tab, ordinal) {
+  let uniqueCount = 0;
+  let totalMemory = 0;
+  for (const procEntry of tab.processes.values()) {
+    const processInfo = procEntry.entryToProcessMap;
+    if (processInfo.tabSet.size == 1) {
+      uniqueCount++;
+    }
+
+    // Guess how much memory the frame might be using by dividing the total
+    // memory used by a process by the number of tabs and frames that are using
+    // that process. Assume that any subframes take up only half as much memory
+    // as a process loaded in a top level tab. So for example, if a process is
+    // used in four top level tabs and two subframes, the top level tabs share
+    // 80% of the memory and the subframes use 20% of the memory.
+    const perFrameMemory =
+      processInfo.memory /
+      (processInfo.topCount * 2 + (processInfo.count - processInfo.topCount));
+    totalMemory += perFrameMemory * procEntry.frameCount;
+  }
+
+  return {
+    tab,
+    uniqueCount,
+    memory: totalMemory,
+    lastAccessed: tab.tab.lastAccessed,
+    ordinal,
+    weight: 0,
+  };
+}
+
+function compareTabResourceRecords(a, b) {
+  if (a.weight != b.weight) {
+    return a.weight - b.weight;
+  }
+
+  return a.lastAccessed - b.lastAccessed;
+}
+
 async function adjustForResourceUse(tabs, processMap, tabMethods) {
   // The second argument is needed for testing.
   await tabMethods.calculateMemoryUsage(processMap, tabs);
 
-  let sortWeight = 0;
-  for (let tab of tabs) {
-    tab.sortWeight = ++sortWeight;
-
-    let uniqueCount = 0;
-    let totalMemory = 0;
-    for (const procEntry of tab.processes.values()) {
-      const processInfo = procEntry.entryToProcessMap;
-      if (processInfo.tabSet.size == 1) {
-        uniqueCount++;
-      }
-
-      // Guess how much memory the frame might be using using by dividing
-      // the total memory used by a process by the number of tabs and
-      // frames that are using that process. Assume that any subframes take up
-      // only half as much memory as a process loaded in a top level tab.
-      // So for example, if a process is used in four top level tabs and two
-      // subframes, the top level tabs share 80% of the memory and the subframes
-      // use 20% of the memory.
-      const perFrameMemory =
-        processInfo.memory /
-        (processInfo.topCount * 2 + (processInfo.count - processInfo.topCount));
-      totalMemory += perFrameMemory * procEntry.frameCount;
-    }
-
-    tab.uniqueCount = uniqueCount;
-    tab.memory = totalMemory;
+  let ordinal = 0;
+  const records = tabs.map(tab => buildTabResourceRecord(tab, ++ordinal));
+  const uniqueFrequency = new Map();
+  for (const record of records) {
+    uniqueFrequency.set(
+      record.uniqueCount,
+      (uniqueFrequency.get(record.uniqueCount) || 0) + 1
+    );
   }
 
-  tabs.sort((a, b) => {
-    return b.uniqueCount - a.uniqueCount;
-  });
-  sortWeight = 0;
-  for (let tab of tabs) {
-    tab.sortWeight += ++sortWeight;
-    if (tab.uniqueCount > 1) {
-      // If the tab has a number of processes that are only used by this tab,
-      // subtract off an additional amount to the sorting weight value. That
-      // way, tabs that use lots of processes are more likely to be discarded.
-      tab.sortWeight -= tab.uniqueCount - 1;
-    }
+  const uniqueRanks = new Map();
+  let runningUnique = 0;
+  for (const value of [...uniqueFrequency.keys()].sort((a, b) => b - a)) {
+    uniqueRanks.set(value, runningUnique);
+    runningUnique += uniqueFrequency.get(value);
   }
 
-  tabs.sort((a, b) => {
-    return b.memory - a.memory;
-  });
-  sortWeight = 0;
-  for (let tab of tabs) {
-    tab.sortWeight += ++sortWeight;
+  const uniqueSeen = new Map();
+  const recordsByUniqueRank = new Array(records.length);
+  for (const record of records) {
+    const seen = uniqueSeen.get(record.uniqueCount) || 0;
+    const rank = 1 + (uniqueRanks.get(record.uniqueCount) || 0) + seen;
+    uniqueSeen.set(record.uniqueCount, seen + 1);
+    record.uniqueRank = rank;
+    recordsByUniqueRank[rank - 1] = record;
   }
 
-  tabs.sort((a, b) => {
-    if (a.sortWeight != b.sortWeight) {
-      return a.sortWeight - b.sortWeight;
-    }
-    return a.tab.lastAccessed - b.tab.lastAccessed;
-  });
+  const memoryFrequency = new Map();
+  for (const record of records) {
+    memoryFrequency.set(
+      record.memory,
+      (memoryFrequency.get(record.memory) || 0) + 1
+    );
+  }
+
+  const memoryRanks = new Map();
+  let runningMemory = 0;
+  for (const value of [...memoryFrequency.keys()].sort((a, b) => b - a)) {
+    memoryRanks.set(value, runningMemory);
+    runningMemory += memoryFrequency.get(value);
+  }
+
+  const memorySeen = new Map();
+  for (const record of recordsByUniqueRank) {
+    const seen = memorySeen.get(record.memory) || 0;
+    const base = memoryRanks.get(record.memory) || 0;
+    record.memoryRank = 1 + base + seen;
+    memorySeen.set(record.memory, seen + 1);
+  }
+
+  for (const record of records) {
+    const penalty = record.uniqueCount > 1 ? record.uniqueCount - 1 : 0;
+    record.weight =
+      record.ordinal + record.uniqueRank + record.memoryRank - penalty;
+  }
+
+  records.sort(compareTabResourceRecords);
+
+  for (let index = 0; index < records.length; index++) {
+    tabs[index] = records[index].tab;
+  }
 }
+
+export const TabUnloaderTestSupport = {
+  buildTabResourceRecordForTests: buildTabResourceRecord,
+  compareTabResourceRecordsForTests: compareTabResourceRecords,
+};

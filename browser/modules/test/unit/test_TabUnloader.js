@@ -3,7 +3,7 @@
  */
 "use strict";
 
-const { TabUnloader } = ChromeUtils.importESModule(
+const { TabUnloader, TabUnloaderTestSupport } = ChromeUtils.importESModule(
   "moz-src:///browser/components/tabbrowser/TabUnloader.sys.mjs"
 );
 
@@ -412,6 +412,128 @@ let globalBrowser = {
   },
 };
 
+add_task(function test_resource_sort_equivalence() {
+  const dataset = [
+    { id: "A", uniqueCount: 3, memory: 100, lastAccessed: 50, ordinal: 1 },
+    { id: "B", uniqueCount: 3, memory: 90, lastAccessed: 40, ordinal: 2 },
+    { id: "C", uniqueCount: 2, memory: 200, lastAccessed: 30, ordinal: 3 },
+    { id: "D", uniqueCount: 2, memory: 200, lastAccessed: 20, ordinal: 4 },
+    { id: "E", uniqueCount: 1, memory: 300, lastAccessed: 10, ordinal: 5 },
+    { id: "F", uniqueCount: 1, memory: 50, lastAccessed: 60, ordinal: 6 },
+  ];
+
+  function legacyOrder(records) {
+    const working = records.map(record => ({
+      id: record.id,
+      uniqueCount: record.uniqueCount,
+      memory: record.memory,
+      lastAccessed: record.lastAccessed,
+      sortWeight: record.ordinal,
+    }));
+
+    working.sort((a, b) => b.uniqueCount - a.uniqueCount);
+    let sortWeight = 0;
+    for (const record of working) {
+      record.sortWeight += ++sortWeight;
+      if (record.uniqueCount > 1) {
+        record.sortWeight -= record.uniqueCount - 1;
+      }
+    }
+
+    working.sort((a, b) => b.memory - a.memory);
+    sortWeight = 0;
+    for (const record of working) {
+      record.sortWeight += ++sortWeight;
+    }
+
+    working.sort((a, b) => {
+      if (a.sortWeight != b.sortWeight) {
+        return a.sortWeight - b.sortWeight;
+      }
+      return a.lastAccessed - b.lastAccessed;
+    });
+
+    return working.map(record => record.id);
+  }
+
+  function modernOrder(records) {
+    const working = records.map(record => ({
+      id: record.id,
+      uniqueCount: record.uniqueCount,
+      memory: record.memory,
+      lastAccessed: record.lastAccessed,
+      ordinal: record.ordinal,
+      weight: 0,
+    }));
+
+    const uniqueFrequency = new Map();
+    for (const record of working) {
+      uniqueFrequency.set(
+        record.uniqueCount,
+        (uniqueFrequency.get(record.uniqueCount) || 0) + 1
+      );
+    }
+
+    const uniqueRanks = new Map();
+    let runningUnique = 0;
+    for (const value of [...uniqueFrequency.keys()].sort((a, b) => b - a)) {
+      uniqueRanks.set(value, runningUnique);
+      runningUnique += uniqueFrequency.get(value);
+    }
+
+    const uniqueSeen = new Map();
+    const recordsByUniqueRank = new Array(working.length);
+    for (const record of working) {
+      const seen = uniqueSeen.get(record.uniqueCount) || 0;
+      const rank = 1 + (uniqueRanks.get(record.uniqueCount) || 0) + seen;
+      uniqueSeen.set(record.uniqueCount, seen + 1);
+      record.uniqueRank = rank;
+      recordsByUniqueRank[rank - 1] = record;
+    }
+
+    const memoryFrequency = new Map();
+    for (const record of working) {
+      memoryFrequency.set(
+        record.memory,
+        (memoryFrequency.get(record.memory) || 0) + 1
+      );
+    }
+
+    const memoryRanks = new Map();
+    let runningMemory = 0;
+    for (const value of [...memoryFrequency.keys()].sort((a, b) => b - a)) {
+      memoryRanks.set(value, runningMemory);
+      runningMemory += memoryFrequency.get(value);
+    }
+
+    const memorySeen = new Map();
+    for (const record of recordsByUniqueRank) {
+      const seen = memorySeen.get(record.memory) || 0;
+      const base = memoryRanks.get(record.memory) || 0;
+      record.memoryRank = 1 + base + seen;
+      memorySeen.set(record.memory, seen + 1);
+    }
+
+    for (const record of working) {
+      const penalty = record.uniqueCount > 1 ? record.uniqueCount - 1 : 0;
+      record.weight =
+        record.ordinal + record.uniqueRank + record.memoryRank - penalty;
+    }
+
+    working.sort((a, b) =>
+      TabUnloaderTestSupport.compareTabResourceRecordsForTests(a, b)
+    );
+
+    return working.map(record => record.id);
+  }
+
+  Assert.deepEqual(
+    modernOrder(dataset),
+    legacyOrder(dataset),
+    "Resource comparator preserves legacy ordering"
+  );
+});
+
 add_task(async function doTests() {
   for (let test of unloadTests) {
     function* iterateTabs() {
@@ -677,6 +799,62 @@ add_task(async function test_no_relax_when_candidate_remains() {
       "Adaptive threshold is not relaxed when candidates were available."
     );
   } finally {
+    TestTabUnloaderMethods.iterateTabs = originalIterateTabs;
+    TabUnloader._resetAdaptiveState();
+  }
+});
+
+add_task(async function test_proc_info_caching_within_episode() {
+  const originalIterateTabs = TestTabUnloaderMethods.iterateTabs;
+  const originalRequestProcInfo = ChromeUtils.requestProcInfo;
+
+  const tabLabels = ["1", "2", "3"];
+  const processes = ["1", "2", "3"];
+  const memory = [100, 200, 300];
+
+  function* iterateTabs() {
+    for (let index = 0; index < tabLabels.length; index++) {
+      yield {
+        tab: {
+          originalIndex: index,
+          lastAccessed: index,
+          keywords: tabLabels[index],
+          process: processes[index],
+        },
+        memory,
+        gBrowser: globalBrowser,
+      };
+    }
+  }
+
+  let callCount = 0;
+  ChromeUtils.requestProcInfo = async () => {
+    callCount++;
+    return {
+      children: [
+        { pid: 1, memory: 100 },
+        { pid: 2, memory: 200 },
+        { pid: 3, memory: 300 },
+      ],
+    };
+  };
+
+  try {
+    TestTabUnloaderMethods.iterateTabs = iterateTabs;
+
+    TabUnloader._resetAdaptiveState();
+    TabUnloader.observe(null, "memory-pressure", "low-memory");
+
+    await TabUnloader.getSortedTabs(0, TestTabUnloaderMethods);
+    await TabUnloader.getSortedTabs(0, TestTabUnloaderMethods);
+
+    Assert.equal(
+      callCount,
+      1,
+      "Proc info snapshot reused across back-to-back passes"
+    );
+  } finally {
+    ChromeUtils.requestProcInfo = originalRequestProcInfo;
     TestTabUnloaderMethods.iterateTabs = originalIterateTabs;
     TabUnloader._resetAdaptiveState();
   }
