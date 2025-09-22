@@ -90,6 +90,7 @@ const MAX_SUGGESTED_TABS = 10;
 const DISSIMILAR_TAB_LABEL = "none";
 const ADULT_TAB_LABEL = "adult content";
 const LABELS_TO_EXCLUDE = [DISSIMILAR_TAB_LABEL, ADULT_TAB_LABEL];
+const TITLE_DELIMS = /(?<=\s)[|–-]+(?=\s)/;
 
 const ML_TASK_FEATURE_EXTRACTION = "feature-extraction";
 const ML_TASK_TEXT2TEXT = "text2text-generation";
@@ -343,11 +344,12 @@ export class SmartTabGroupingManager {
       ...alreadyGroupedIndices,
       ...tabURLIndicesToExclude,
     ];
+    const excluded = new Set(excludedTabIndices);
 
     // tabs to be included
     return allTabs
       .map((_, index) => index)
-      .filter(i => !excludedTabIndices.includes(i));
+      .filter(i => !excluded.has(i));
   }
 
   /*
@@ -371,12 +373,13 @@ export class SmartTabGroupingManager {
     // get embeddings for all the tabs
     const tabData = await this._prepareTabData(allTabs);
     let embeddings = precomputedEmbeddings;
+    const groupedSet = new Set(groupedIndices);
     if (precomputedEmbeddings.length === 0) {
       embeddings = await this._generateEmbeddings(
         tabData.map((td, index) => {
           let text = SmartTabGroupingManager.preprocessText(td[EMBED_TEXT_KEY]);
           // augment with group name if it's present
-          if (groupLabel && groupedIndices.includes(index)) {
+          if (groupLabel && groupedSet.has(index)) {
             text = `${groupLabel.slice(0, 100)}. ${text}`;
           }
           return text;
@@ -1105,8 +1108,7 @@ export class SmartTabGroupingManager {
     // Matches 'xyz - Domain' or 'xyz | Domain'
     // with a space before and after delimiter
     // or if there are multiple delimiters next to each other
-    const delimiters = /(?<=\s)[|–-]+(?=\s)/;
-    const splitText = text.split(delimiters);
+    const splitText = text.split(TITLE_DELIMS);
 
     // ensure there's enough info without the last element
     const hasEnoughInfo =
