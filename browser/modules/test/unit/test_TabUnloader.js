@@ -499,6 +499,10 @@ add_task(async function test_adaptive_inactive_duration() {
     stats.skippedFreshDiscardable,
     "Detected that fresh discardable tabs were skipped."
   );
+  Assert.ok(
+    !stats.hadDiscardableCandidate,
+    "No discardable candidates were returned while tabs were still fresh."
+  );
   Assert.equal(
     TabUnloader._adaptiveMinInactiveDuration,
     Math.floor(minInactiveDuration / 2),
@@ -532,4 +536,148 @@ add_task(async function test_adaptive_inactive_duration() {
 
   TestTabUnloaderMethods.iterateTabs = originalIterateTabs;
   TabUnloader._resetAdaptiveState();
+});
+
+add_task(async function test_adaptive_relaxation_with_undiscardable_tabs() {
+  const originalIterateTabs = TestTabUnloaderMethods.iterateTabs;
+
+  const browserStub = {
+    async prepareDiscardBrowser() {},
+    discardBrowser() {
+      return true;
+    },
+  };
+
+  function createTab(lastAccessed, keywords) {
+    return {
+      tab: {
+        lastAccessed,
+        keywords,
+        process: "1",
+        updateLastUnloadedByTabUnloader() {},
+      },
+      gBrowser: browserStub,
+    };
+  }
+
+  function* iterateTabsWithSelected() {
+    yield createTab(90, "fresh-candidate");
+    yield createTab(10, "selected anchor");
+  }
+
+  function* iterateTabsAfterRelax() {
+    yield createTab(10, "fresh-candidate");
+    yield createTab(5, "selected anchor");
+  }
+
+  try {
+    TestTabUnloaderMethods.iterateTabs = iterateTabsWithSelected;
+
+    TabUnloader._resetAdaptiveState();
+    const minInactiveDuration = 40;
+
+    let stats = {};
+    let didUnload = await TabUnloader.unloadLeastRecentlyUsedTab(
+      minInactiveDuration,
+      TestTabUnloaderMethods,
+      stats
+    );
+
+    Assert.ok(
+      !didUnload,
+      "Unload attempt fails while only undiscardable tabs remain."
+    );
+    Assert.ok(
+      stats.skippedFreshDiscardable,
+      "Fresh discardable tab was skipped despite an undiscardable tab being present."
+    );
+    Assert.ok(
+      !stats.hadDiscardableCandidate,
+      "No discardable candidates were available once filtering completed."
+    );
+    Assert.equal(
+      TabUnloader._adaptiveMinInactiveDuration,
+      Math.floor(minInactiveDuration / 2),
+      "Adaptive threshold halves even when only undiscardable tabs remain."
+    );
+
+    TestTabUnloaderMethods.iterateTabs = iterateTabsAfterRelax;
+
+    stats = {};
+    didUnload = await TabUnloader.unloadLeastRecentlyUsedTab(
+      minInactiveDuration,
+      TestTabUnloaderMethods,
+      stats
+    );
+    Assert.ok(
+      didUnload,
+      "Previously fresh tab becomes discardable after adaptive relaxation."
+    );
+  } finally {
+    TestTabUnloaderMethods.iterateTabs = originalIterateTabs;
+    TabUnloader._resetAdaptiveState();
+  }
+});
+
+add_task(async function test_no_relax_when_candidate_remains() {
+  const originalIterateTabs = TestTabUnloaderMethods.iterateTabs;
+
+  const browserStub = {
+    async prepareDiscardBrowser() {},
+    discardBrowser() {
+      return false;
+    },
+  };
+
+  function createTab(lastAccessed, keywords) {
+    return {
+      tab: {
+        lastAccessed,
+        keywords,
+        process: "1",
+        updateLastUnloadedByTabUnloader() {},
+      },
+      gBrowser: browserStub,
+    };
+  }
+
+  function* iterateTabs() {
+    yield createTab(50, "eligible");
+    yield createTab(95, "fresh-candidate");
+  }
+
+  try {
+    TestTabUnloaderMethods.iterateTabs = iterateTabs;
+
+    TabUnloader._resetAdaptiveState();
+    const minInactiveDuration = 40;
+
+    let stats = {};
+    const didUnload = await TabUnloader.unloadLeastRecentlyUsedTab(
+      minInactiveDuration,
+      TestTabUnloaderMethods,
+      stats
+    );
+
+    Assert.ok(
+      !didUnload,
+      "Unload attempt fails because the browser refuses to discard the tab."
+    );
+    Assert.ok(
+      stats.skippedFreshDiscardable,
+      "Fresh discardable tab was skipped during the attempt."
+    );
+    Assert.ok(
+      stats.hadDiscardableCandidate,
+      "A discardable candidate was present in the result set."
+    );
+    Assert.strictEqual(
+      TabUnloader._adaptiveMinInactiveDuration,
+      null,
+      "Adaptive threshold is not relaxed when candidates were available."
+    );
+  } finally {
+    TestTabUnloaderMethods.iterateTabs = originalIterateTabs;
+    TabUnloader._resetAdaptiveState();
+  }
 });
