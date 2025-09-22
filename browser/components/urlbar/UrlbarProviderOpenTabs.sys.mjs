@@ -11,10 +11,13 @@ import {
   UrlbarProvider,
   UrlbarUtils,
 } from "moz-src:///browser/components/urlbar/UrlbarUtils.sys.mjs";
+import { Services } from "resource://gre/modules/Services.sys.mjs";
 
 const lazy = {};
 
 ChromeUtils.defineESModuleGetters(lazy, {
+  AsyncShutdown: "resource://gre/modules/AsyncShutdown.sys.mjs",
+  DeferredTask: "resource://gre/modules/DeferredTask.sys.mjs",
   PlacesUtils: "resource://gre/modules/PlacesUtils.sys.mjs",
   ProvidersManager:
     "moz-src:///browser/components/urlbar/UrlbarProvidersManager.sys.mjs",
@@ -33,6 +36,180 @@ const PRIVATE_USER_CONTEXT_ID = -1;
  *   Map(userContextId => Map(groupId | null => Map(url => count)))
  */
 var gOpenTabUrls = new Map();
+
+const MEMORY_TABLE_FLUSH_DELAY_MS = 200;
+const MEMORY_TABLE_IDLE_TIMEOUT_MS = 1000;
+const SQLITE_MAX_VARIABLES = 999;
+const SQLITE_VARIABLES_PER_ENTRY = 4;
+const MAX_UPDATES_PER_STATEMENT = Math.floor(
+  SQLITE_MAX_VARIABLES / SQLITE_VARIABLES_PER_ENTRY
+);
+
+let gPendingMemoryTableDeltas = new Map();
+let gMemoryTableFlushTask = null;
+let gIdleFlushDispatched = false;
+let gOngoingFlushPromise = null;
+
+function ensureMemoryTableFlushTask() {
+  if (!gMemoryTableFlushTask) {
+    gMemoryTableFlushTask = new lazy.DeferredTask(
+      () => flushPendingMemoryTableUpdates(),
+      MEMORY_TABLE_FLUSH_DELAY_MS,
+      MEMORY_TABLE_IDLE_TIMEOUT_MS
+    );
+  }
+  return gMemoryTableFlushTask;
+}
+
+function scheduleIdleFlush() {
+  if (gIdleFlushDispatched) {
+    return;
+  }
+  gIdleFlushDispatched = true;
+  Services.tm.idleDispatchToMainThread(async () => {
+    gIdleFlushDispatched = false;
+    await flushPendingMemoryTableUpdates();
+  });
+}
+
+function scheduleMemoryTableFlush() {
+  if (!UrlbarProviderOpenTabs.memoryTableInitialized) {
+    return;
+  }
+  if (!gPendingMemoryTableDeltas.size) {
+    if (gMemoryTableFlushTask?.isArmed) {
+      gMemoryTableFlushTask.disarm();
+    }
+    return;
+  }
+  ensureMemoryTableFlushTask().arm();
+  scheduleIdleFlush();
+}
+
+function getMemoryTableKey(url, userContextId, groupId) {
+  return `${userContextId}\n${groupId ?? ""}\n${url}`;
+}
+
+function queueMemoryTableDelta(url, userContextId, groupId, delta) {
+  if (!UrlbarProviderOpenTabs.memoryTableInitialized || delta === 0) {
+    return;
+  }
+
+  let key = getMemoryTableKey(url, userContextId, groupId);
+  let update = gPendingMemoryTableDeltas.get(key);
+  let newDelta = (update?.delta ?? 0) + delta;
+  if (newDelta === 0) {
+    gPendingMemoryTableDeltas.delete(key);
+  } else {
+    gPendingMemoryTableDeltas.set(key, {
+      url,
+      userContextId,
+      groupId,
+      delta: newDelta,
+    });
+  }
+  scheduleMemoryTableFlush();
+}
+
+async function flushPendingMemoryTableUpdates() {
+  if (gOngoingFlushPromise) {
+    return gOngoingFlushPromise;
+  }
+  if (
+    !UrlbarProviderOpenTabs.memoryTableInitialized ||
+    !gPendingMemoryTableDeltas.size
+  ) {
+    return;
+  }
+
+  let updatesToFlush = gPendingMemoryTableDeltas;
+  gPendingMemoryTableDeltas = new Map();
+
+  let flushPromise = (async () => {
+    try {
+      let updatesArray = Array.from(updatesToFlush.values());
+      if (!updatesArray.length) {
+        return;
+      }
+      await lazy.ProvidersManager.runInCriticalSection(async () => {
+        let conn = await lazy.PlacesUtils.promiseLargeCacheDBConnection();
+        for (let i = 0; i < updatesArray.length; i += MAX_UPDATES_PER_STATEMENT) {
+          let chunk = updatesArray.slice(i, i + MAX_UPDATES_PER_STATEMENT);
+          let valuesSql = chunk
+            .map(
+              (update, index) =>
+                `(:url${index}, :userContextId${index}, IFNULL(:groupId${index}, ''), :delta${index})`
+            )
+            .join(", ");
+          let params = {};
+          for (let [index, update] of chunk.entries()) {
+            params[`url${index}`] = update.url;
+            params[`userContextId${index}`] = update.userContextId;
+            params[`groupId${index}`] = update.groupId;
+            params[`delta${index}`] = update.delta;
+          }
+          await conn.executeCached(
+            `INSERT INTO moz_openpages_temp (url, userContextId, groupId, open_count)
+             VALUES ${valuesSql}
+             ON CONFLICT(url, userContextId, groupId)
+             DO UPDATE SET open_count = open_count + excluded.open_count`,
+            params
+          );
+        }
+      });
+    } catch (error) {
+      // Restore the updates so that they can be retried on the next flush.
+      for (let [key, update] of updatesToFlush.entries()) {
+        let existing = gPendingMemoryTableDeltas.get(key);
+        let delta = (existing?.delta ?? 0) + update.delta;
+        if (delta === 0) {
+          gPendingMemoryTableDeltas.delete(key);
+        } else {
+          gPendingMemoryTableDeltas.set(key, {
+            url: update.url,
+            userContextId: update.userContextId,
+            groupId: update.groupId,
+            delta,
+          });
+        }
+      }
+      throw error;
+    }
+  })();
+
+  gOngoingFlushPromise = flushPromise;
+  try {
+    await flushPromise;
+  } catch (error) {
+    console.error(error);
+  } finally {
+    gOngoingFlushPromise = null;
+    if (gPendingMemoryTableDeltas.size) {
+      scheduleMemoryTableFlush();
+    }
+  }
+  return flushPromise;
+}
+
+lazy.AsyncShutdown.profileBeforeChange.addBlocker(
+  "UrlbarProviderOpenTabs: flush open tabs memory table",
+  async () => {
+    if (!UrlbarProviderOpenTabs.memoryTableInitialized) {
+      return;
+    }
+    if (gMemoryTableFlushTask?.isArmed) {
+      gMemoryTableFlushTask.disarm();
+    }
+    if (gMemoryTableFlushTask && !gMemoryTableFlushTask.isFinalized) {
+      try {
+        await gMemoryTableFlushTask.finalize();
+      } catch (error) {
+        console.error(error);
+      }
+    }
+    await flushPendingMemoryTableUpdates();
+  }
+);
 
 /**
  * Class used to create the provider.
@@ -145,6 +322,8 @@ export class UrlbarProviderOpenTabs extends UrlbarProvider {
    * @returns {Promise<{url: string, userContextId: number, groupId: string | null, count: number}[]>}
    */
   static async getDatabaseRegisteredOpenTabsForTests() {
+    await UrlbarProviderOpenTabs.promiseDBPopulated;
+    await flushPendingMemoryTableUpdates();
     let conn = await lazy.PlacesUtils.promiseLargeCacheDBConnection();
     let rows = await conn.execute(
       "SELECT url, userContextId, NULLIF(groupId, '') groupId, open_count" +
@@ -156,6 +335,14 @@ export class UrlbarProviderOpenTabs extends UrlbarProvider {
       tabGroup: r.getResultByName("groupId"),
       count: r.getResultByName("open_count"),
     }));
+  }
+
+  static async flushPendingMemoryTableUpdatesForTests() {
+    await UrlbarProviderOpenTabs.promiseDBPopulated;
+    if (gMemoryTableFlushTask?.isArmed) {
+      gMemoryTableFlushTask.disarm();
+    }
+    await flushPendingMemoryTableUpdates();
   }
 
   /**
@@ -202,12 +389,11 @@ export class UrlbarProviderOpenTabs extends UrlbarProvider {
       for (let [userContextId, groupEntries] of gOpenTabUrls) {
         for (let [groupId, entries] of groupEntries) {
           for (let [url, count] of entries) {
-            await addToMemoryTable(url, userContextId, groupId, count).catch(
-              console.error
-            );
+            queueMemoryTableDelta(url, userContextId, groupId, count);
           }
         }
       }
+      await flushPendingMemoryTableUpdates();
     });
 
   /**
@@ -256,7 +442,7 @@ export class UrlbarProviderOpenTabs extends UrlbarProvider {
     }
 
     groupEntries.set(url, (groupEntries.get(url) ?? 0) + 1);
-    await addToMemoryTable(url, userContextId, groupId).catch(console.error);
+    queueMemoryTableDelta(url, userContextId, groupId, 1);
   }
 
   /**
@@ -305,9 +491,7 @@ export class UrlbarProviderOpenTabs extends UrlbarProvider {
         } else {
           groupEntries.set(url, oldCount - 1);
         }
-        await removeFromMemoryTable(url, userContextId, groupId).catch(
-          console.error
-        );
+        queueMemoryTableDelta(url, userContextId, groupId, -1);
       }
     }
   }
@@ -357,59 +541,3 @@ export class UrlbarProviderOpenTabs extends UrlbarProvider {
   }
 }
 
-/**
- * Adds an open page to the memory table.
- *
- * @param {string} url Address of the page
- * @param {number} userContextId Containers user context id
- * @param {?string} groupId The id of the group the tab belongs to
- * @param {number} [count] The number of times the page is open
- * @returns {Promise} resolved after the addition.
- */
-async function addToMemoryTable(url, userContextId, groupId, count = 1) {
-  if (!UrlbarProviderOpenTabs.memoryTableInitialized) {
-    return;
-  }
-  await lazy.ProvidersManager.runInCriticalSection(async () => {
-    let conn = await lazy.PlacesUtils.promiseLargeCacheDBConnection();
-    await conn.executeCached(
-      `
-      INSERT INTO moz_openpages_temp (url, userContextId, groupId, open_count)
-      VALUES ( :url,
-               :userContextId,
-               IFNULL(:groupId, ''),
-               :count
-             )
-      ON CONFLICT DO UPDATE SET open_count = open_count + 1
-    `,
-      { url, userContextId, groupId, count }
-    );
-  });
-}
-
-/**
- * Removes an open page from the memory table.
- *
- * @param {string} url Address of the page
- * @param {number} userContextId Containers user context id
- * @param {?string} groupId The id of the group the tab belongs to
- * @returns {Promise} resolved after the removal.
- */
-async function removeFromMemoryTable(url, userContextId, groupId) {
-  if (!UrlbarProviderOpenTabs.memoryTableInitialized) {
-    return;
-  }
-  await lazy.ProvidersManager.runInCriticalSection(async () => {
-    let conn = await lazy.PlacesUtils.promiseLargeCacheDBConnection();
-    await conn.executeCached(
-      `
-      UPDATE moz_openpages_temp
-      SET open_count = open_count - 1
-      WHERE url = :url
-        AND userContextId = :userContextId
-        AND groupId = IFNULL(:groupId, '')
-    `,
-      { url, userContextId, groupId }
-    );
-  });
-}

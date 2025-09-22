@@ -189,6 +189,7 @@ add_task(async function test_switchTab() {
     null,
     false
   );
+  await UrlbarProviderOpenTabs.flushPendingMemoryTableUpdatesForTests();
   await PlacesTestUtils.addVisits([url1, url2]);
   const provider = new UrlbarProviderSemanticHistorySearch();
 
@@ -287,6 +288,7 @@ add_task(async function test_switchTab() {
     tabGroudId2,
     false
   );
+  await UrlbarProviderOpenTabs.flushPendingMemoryTableUpdatesForTests();
   const groupContext = createContext("firefox", {
     isPrivate: false,
     currentPage: url1,

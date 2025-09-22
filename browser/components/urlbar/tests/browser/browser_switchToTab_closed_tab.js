@@ -43,6 +43,7 @@ add_task(async function test_switchToTab_tab_closed() {
     null,
     false
   );
+  await UrlbarProviderOpenTabs.flushPendingMemoryTableUpdatesForTests();
 
   Assert.equal(
     await openPagesCount(),
@@ -79,6 +80,7 @@ add_task(async function test_switchToTab_tab_closed() {
   );
 
   gBrowser.removeTab(gBrowser.selectedTab);
+  await UrlbarProviderOpenTabs.flushPendingMemoryTableUpdatesForTests();
 
   Assert.equal(
     await openPagesCount(),

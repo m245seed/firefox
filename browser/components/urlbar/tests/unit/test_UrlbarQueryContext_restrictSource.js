@@ -23,6 +23,7 @@ add_task(async function test_restrictions() {
     null,
     false
   );
+  await UrlbarProviderOpenTabs.flushPendingMemoryTableUpdatesForTests();
 
   info("Bookmark restrict");
   let results = await get_results({
