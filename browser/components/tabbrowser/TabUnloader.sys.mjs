@@ -378,12 +378,18 @@ export var TabUnloader = {
       info
     );
 
+    let hadDiscardableCandidate = false;
+    let blockedByUndiscardable = false;
     for (let tabInfo of sortedTabs) {
-      if (!this.isDiscardable(tabInfo)) {
+      const discardable = this.isDiscardable(tabInfo);
+      if (!discardable) {
         // Since |sortedTabs| is sorted, once we see an undiscardable tab
-        // no need to continue the loop.
-        return false;
+        // no need to continue the loop, but ensure adaptive tracking runs.
+        blockedByUndiscardable = true;
+        break;
       }
+
+      hadDiscardableCandidate = true;
 
       const remoteType = tabInfo.tab?.linkedBrowser?.remoteType;
       await tabInfo.gBrowser.prepareDiscardBrowser(tabInfo.tab);
@@ -396,9 +402,16 @@ export var TabUnloader = {
         return true;
       }
     }
+
+    if (info) {
+      info.hadDiscardableCandidate = hadDiscardableCandidate;
+      info.blockedByUndiscardable = blockedByUndiscardable;
+    }
+
     if (
       info.skippedFreshDiscardable &&
-      typeof minInactiveDuration == "number"
+      typeof minInactiveDuration == "number" &&
+      !hadDiscardableCandidate
     ) {
       this._registerFreshnessBlocked(minInactiveDuration);
       info.adaptiveMinInactiveDuration = this._adaptiveMinInactiveDuration;
