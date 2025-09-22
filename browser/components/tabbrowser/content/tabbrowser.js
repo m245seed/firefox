@@ -256,6 +256,7 @@
     _contentWaitingCount = 0;
 
     _tabLayerCache = [];
+    _tabLayerCacheSet = new Set();
 
     tabAnimationsInProgress = 0;
 
@@ -5116,9 +5117,11 @@
 
       // this._switcher would normally cover removing a tab from this
       // cache, but we may not have one at this time.
-      let tabCacheIndex = this._tabLayerCache.indexOf(aTab);
-      if (tabCacheIndex != -1) {
-        this._tabLayerCache.splice(tabCacheIndex, 1);
+      if (this._tabLayerCacheSet.delete(aTab)) {
+        let tabCacheIndex = this._tabLayerCache.indexOf(aTab);
+        if (tabCacheIndex != -1) {
+          this._tabLayerCache.splice(tabCacheIndex, 1);
+        }
       }
 
       // Delay hiding the the active tab if we're screen sharing.
@@ -8719,10 +8722,12 @@
         }
 
         if (this.mTab != gBrowser.selectedTab) {
-          let tabCacheIndex = gBrowser._tabLayerCache.indexOf(this.mTab);
-          if (tabCacheIndex != -1) {
-            gBrowser._tabLayerCache.splice(tabCacheIndex, 1);
-            gBrowser._getSwitcher().cleanUpTabAfterEviction(this.mTab);
+          if (gBrowser._tabLayerCacheSet.delete(this.mTab)) {
+            let tabCacheIndex = gBrowser._tabLayerCache.indexOf(this.mTab);
+            if (tabCacheIndex != -1) {
+              gBrowser._tabLayerCache.splice(tabCacheIndex, 1);
+              gBrowser._getSwitcher().cleanUpTabAfterEviction(this.mTab);
+            }
           }
         }
       }
