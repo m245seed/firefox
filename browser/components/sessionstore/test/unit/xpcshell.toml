@@ -20,6 +20,8 @@ skip-if = [
 
 ["test_histogram_corrupt_files.js"]
 
+["test_last_closed_object_type.js"]
+
 ["test_migration_lz4compression.js"]
 skip-if = [
   "os == 'linux' && os_version == '18.04' && processor == 'x86_64' && opt && condprof", # Bug 1769154

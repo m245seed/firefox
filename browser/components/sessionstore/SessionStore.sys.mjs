@@ -1212,16 +1212,24 @@ var SessionStoreInternal = {
       // Since there are closed windows, we need to check if there's a closed tab
       // in one of the currently open windows that was closed after the
       // last-closed window.
-      let tabTimestamps = [];
+      let hasClosedTab = false;
+      let latestTabClosedAt;
       for (let window of Services.wm.getEnumerator("navigator:browser")) {
         let windowState = this._windows[window.__SSi];
         if (windowState && windowState._closedTabs[0]) {
-          tabTimestamps.push(windowState._closedTabs[0].closedAt);
+          hasClosedTab = true;
+          let closedAt = windowState._closedTabs[0].closedAt;
+          if (
+            latestTabClosedAt === undefined ||
+            closedAt > latestTabClosedAt
+          ) {
+            latestTabClosedAt = closedAt;
+          }
         }
       }
       if (
-        !tabTimestamps.length ||
-        tabTimestamps.sort((a, b) => b - a)[0] < this._closedWindows[0].closedAt
+        !hasClosedTab ||
+        latestTabClosedAt < this._closedWindows[0].closedAt
       ) {
         return this._LAST_ACTION_CLOSED_WINDOW;
       }
@@ -8852,3 +8860,4 @@ function removeWhere(array, predicate) {
 
 // Exposed for tests
 export const _LastSession = LastSession;
+export const _SessionStoreInternal = SessionStoreInternal;
