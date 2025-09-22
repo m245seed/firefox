@@ -1073,17 +1073,7 @@ BrowserGlue.prototype = {
       // Begin listening for incoming push messages.
       {
         name: "PushService.ensureReady",
-        task: () => {
-          try {
-            lazy.PushService.wrappedJSObject.ensureReady();
-          } catch (ex) {
-            // NS_ERROR_NOT_AVAILABLE will get thrown for the PushService
-            // getter if the PushService is disabled.
-            if (ex.result != Cr.NS_ERROR_NOT_AVAILABLE) {
-              throw ex;
-            }
-          }
-        },
+        task: () => this._maybeEnsurePushServiceReady(),
       },
 
       // Load the Login Manager data from disk off the main thread, some time
@@ -1315,6 +1305,22 @@ BrowserGlue.prototype = {
     ];
 
     runIdleTasks(lateTasks);
+  },
+
+  async _maybeEnsurePushServiceReady() {
+    try {
+      const pushService = lazy.PushService.wrappedJSObject;
+      if (!(await pushService.hasSubscriptions())) {
+        return;
+      }
+      pushService.ensureReady();
+    } catch (ex) {
+      // NS_ERROR_NOT_AVAILABLE will get thrown for the PushService getter if the
+      // PushService is disabled.
+      if (ex.result != Cr.NS_ERROR_NOT_AVAILABLE) {
+        throw ex;
+      }
+    }
   },
 
   /**

@@ -555,6 +555,27 @@ export var PushService = {
     });
   },
 
+  async hasSubscriptions() {
+    let db = this._db;
+    let shouldClose = false;
+
+    if (!db) {
+      db = lazy.PushServiceWebSocket.newPushDB();
+      shouldClose = true;
+    }
+
+    try {
+      return await db.hasRecords();
+    } catch (error) {
+      lazy.console.warn("hasSubscriptions: Falling back to starting service", error);
+      return true;
+    } finally {
+      if (shouldClose && db) {
+        db.close();
+      }
+    }
+  },
+
   /**
    * PushService uninitialization is divided into 3 parts:
    * stopObservers() - stot observers started in startObservers.

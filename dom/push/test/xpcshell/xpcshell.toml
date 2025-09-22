@@ -23,6 +23,8 @@ run-sequentially = "This will delete all existing push subscriptions."
 
 ["test_handler_service.js"]
 
+["test_has_subscriptions.js"]
+
 ["test_notification_ack.js"]
 
 ["test_notification_data.js"]

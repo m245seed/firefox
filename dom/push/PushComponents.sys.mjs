@@ -69,6 +69,10 @@ PushServiceBase.prototype = {
 
   ensureReady() {},
 
+  hasSubscriptions() {
+    return Promise.resolve(false);
+  },
+
   _addListeners() {
     for (let message of this._messages) {
       this._mm.addMessageListener(message, this);
@@ -262,6 +266,17 @@ Object.assign(PushServiceParent.prototype, {
 
   ensureReady() {
     this.service.init();
+  },
+
+  async hasSubscriptions() {
+    if (this._service && typeof this._service.hasSubscriptions == "function") {
+      return this._service.hasSubscriptions();
+    }
+
+    const { PushService } = ChromeUtils.importESModule(
+      "resource://gre/modules/PushService.sys.mjs"
+    );
+    return PushService.hasSubscriptions();
   },
 
   _toPageRecord(principal, data) {
