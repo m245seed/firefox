@@ -293,6 +293,29 @@ PushDB.prototype = {
     );
   },
 
+  hasRecords() {
+    lazy.console.debug("hasRecords()");
+
+    return new Promise((resolve, reject) =>
+      this.newTxn(
+        "readonly",
+        this._dbStoreName,
+        (aTxn, aStore) => {
+          aTxn.result = false;
+
+          aStore.openCursor().onsuccess = event => {
+            let cursor = event.target.result;
+            if (cursor) {
+              aTxn.result = true;
+            }
+          };
+        },
+        resolve,
+        reject
+      )
+    );
+  },
+
   _getAllByKey(aKeyName, aKeyValue) {
     return new Promise((resolve, reject) =>
       this.newTxn(
