@@ -10,14 +10,17 @@
 #include "mozilla/AppShutdown.h"
 #include "mozilla/ClearOnShutdown.h"
 #include "mozilla/Preferences.h"
+#include "mozilla/ProcInfo.h"
 #include "mozilla/ProfilerMarkers.h"
 #include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/Telemetry.h"
 #include "mozilla/Maybe.h"
 #include "mozilla/Unused.h"
 #include "mozilla/dom/ContentParent.h"
 #include "mozilla/dom/ScriptSettings.h"
 #include "nsIPropertyBag2.h"
 #include "nsPrintfCString.h"
+#include "nsString.h"
 #include "nsIXULRuntime.h"
 #include "nsServiceManagerUtils.h"
 #include "nsTArray.h"
@@ -25,6 +28,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 using namespace mozilla::hal;
 using namespace mozilla::dom;
@@ -76,12 +80,24 @@ class PreallocatedProcessManagerImpl final : public nsIObserver {
   void RecordLaunchCompletion(ContentParent* aParent,
                               const TimeStamp& aStartTime,
                               const TimeStamp& aReadyTime);
+  Maybe<double> SampleProcessCpuLoad(const TimeStamp& aSampleTime);
   uint32_t ComputeDynamicDelayMs() const;
   uint32_t GetMinDelayMs() const;
   uint32_t GetMaxDelayMs() const;
+  struct HeuristicEvaluation {
+    double mAverageDurationMs = 0.0;
+    double mPreviousDelayMs = 0.0;
+    bool mRecentMemoryPressure = false;
+    bool mRecentHighCpu = false;
+    bool mRecentOverlap = false;
+    size_t mCheapCount = 0;
+    size_t mContentionCount = 0;
+    size_t mSampleCount = 0;
+    Maybe<double> mLastCpuLoad;
+    Maybe<TimeDuration> mGapSincePrevious;
+  };
   void LogLaunchHeuristics(ContentParent* aParent, uint32_t aDelayMs,
-                           double aAverageDuration, double aPreviousDelay,
-                           bool aMemoryPressure) const;
+                           const HeuristicEvaluation& aEvaluation) const;
 
   void RereadPrefs();
   void Enable(uint32_t aProcesses);
@@ -111,10 +127,15 @@ class PreallocatedProcessManagerImpl final : public nsIObserver {
     TimeStamp mReadyTime;
     TimeDuration mDuration;
     bool mMemoryPressure;
+    Maybe<double> mCpuLoad;
   };
   AutoTArray<CompletedPrelaunch, 8> mRecentLaunches;
   TimeStamp mLastMemoryPressureNotification;
   mutable uint32_t mLastComputedDelayMs;
+  bool mHasCpuSample;
+  uint64_t mLastCpuSampleMs;
+  TimeStamp mLastCpuSampleTime;
+  mutable HeuristicEvaluation mLastHeuristicEvaluation;
 };
 
 /* static */
@@ -147,7 +168,12 @@ NS_IMPL_ISUPPORTS(PreallocatedProcessManagerImpl, nsIObserver)
 PreallocatedProcessManagerImpl::PreallocatedProcessManagerImpl()
     : mEnabled(false),
       mNumberPreallocs(1),
-      mLastComputedDelayMs(StaticPrefs::dom_ipc_processPrelaunch_delayMs()) {}
+      mLastComputedDelayMs(StaticPrefs::dom_ipc_processPrelaunch_delayMs()),
+      mHasCpuSample(false),
+      mLastCpuSampleMs(0) {
+  mLastHeuristicEvaluation.mPreviousDelayMs =
+      static_cast<double>(mLastComputedDelayMs);
+}
 
 PreallocatedProcessManagerImpl::~PreallocatedProcessManagerImpl() {
   // Note: mPreallocatedProcesses may not be null, but all processes should
@@ -439,6 +465,49 @@ Maybe<TimeStamp> PreallocatedProcessManagerImpl::TakePendingLaunchStart(
   return Nothing();
 }
 
+Maybe<double> PreallocatedProcessManagerImpl::SampleProcessCpuLoad(
+    const TimeStamp& aSampleTime) {
+  if (aSampleTime.IsNull()) {
+    return Nothing();
+  }
+
+  uint64_t cpuTimeMs = 0;
+  if (NS_FAILED(GetCpuTimeSinceProcessStartInMs(&cpuTimeMs))) {
+    return Nothing();
+  }
+
+  if (!mHasCpuSample || mLastCpuSampleTime.IsNull()) {
+    mHasCpuSample = true;
+    mLastCpuSampleMs = cpuTimeMs;
+    mLastCpuSampleTime = aSampleTime;
+    return Nothing();
+  }
+
+  if (cpuTimeMs <= mLastCpuSampleMs || aSampleTime <= mLastCpuSampleTime) {
+    mLastCpuSampleMs = cpuTimeMs;
+    mLastCpuSampleTime = aSampleTime;
+    return Nothing();
+  }
+
+  const uint64_t cpuDeltaMs = cpuTimeMs - mLastCpuSampleMs;
+  const double wallDeltaMs = (aSampleTime - mLastCpuSampleTime).ToMilliseconds();
+  mLastCpuSampleMs = cpuTimeMs;
+  mLastCpuSampleTime = aSampleTime;
+
+  if (wallDeltaMs <= 0.0) {
+    return Nothing();
+  }
+
+  uint32_t processorCount = PR_GetNumberOfProcessors();
+  processorCount = std::max(processorCount, 1u);
+
+  const double normalizedLoad =
+      std::clamp((static_cast<double>(cpuDeltaMs) / wallDeltaMs) /
+                     static_cast<double>(processorCount),
+                 0.0, 1.0);
+  return Some(normalizedLoad);
+}
+
 void PreallocatedProcessManagerImpl::RecordLaunchCompletion(
     ContentParent* aParent, const TimeStamp& aStartTime,
     const TimeStamp& aReadyTime) {
@@ -451,6 +520,9 @@ void PreallocatedProcessManagerImpl::RecordLaunchCompletion(
     }
   }
 
+  const TimeStamp cpuSampleTime = aReadyTime.IsNull() ? TimeStamp::Now() : aReadyTime;
+  Maybe<double> cpuLoad = SampleProcessCpuLoad(cpuSampleTime);
+
   auto& record = *mRecentLaunches.AppendElement();
   record.mStartTime = aStartTime;
   record.mReadyTime = aReadyTime;
@@ -458,6 +530,7 @@ void PreallocatedProcessManagerImpl::RecordLaunchCompletion(
       (!aReadyTime.IsNull() && !aStartTime.IsNull()) ? aReadyTime - aStartTime
                                                      : TimeDuration();
   record.mMemoryPressure = memoryPressure;
+  record.mCpuLoad = cpuLoad;
 
   constexpr size_t kMaxRecentLaunches = 8;
   if (mRecentLaunches.Length() > kMaxRecentLaunches) {
@@ -465,30 +538,62 @@ void PreallocatedProcessManagerImpl::RecordLaunchCompletion(
                                             kMaxRecentLaunches);
   }
 
-  double totalDurationMs = 0.0;
-  bool recentMemoryPressure = false;
-  const size_t sampleCount =
-      std::min<size_t>(mRecentLaunches.Length(), size_t(3));
-  for (size_t offset = mRecentLaunches.Length() - sampleCount;
-       offset < mRecentLaunches.Length(); ++offset) {
-    const auto& sample = mRecentLaunches[offset];
-    totalDurationMs += sample.mDuration.ToMilliseconds();
-    recentMemoryPressure |= sample.mMemoryPressure;
+  Maybe<TimeDuration> sincePreviousReady;
+  if (mRecentLaunches.Length() >= 2) {
+    const auto& previous = mRecentLaunches[mRecentLaunches.Length() - 2];
+    if (!previous.mReadyTime.IsNull() && !aStartTime.IsNull()) {
+      sincePreviousReady = Some(aStartTime - previous.mReadyTime);
+    }
   }
-  const double averageDurationMs =
-      sampleCount ? (totalDurationMs / sampleCount) : 0.0;
 
-  const uint32_t previousDelay = mLastComputedDelayMs;
   const uint32_t delayMs = ComputeDynamicDelayMs();
-  LogLaunchHeuristics(aParent, delayMs, averageDurationMs, previousDelay,
-                      recentMemoryPressure);
+  HeuristicEvaluation evaluation = mLastHeuristicEvaluation;
+  evaluation.mGapSincePrevious = sincePreviousReady;
+
+  LogLaunchHeuristics(aParent, delayMs, evaluation);
+
+  const double lastDurationMs = record.mDuration.ToMilliseconds();
+  const double clampedDurationMs = std::max(0.0, lastDurationMs);
+  const uint32_t durationTelemetry = static_cast<uint32_t>(
+      std::min(clampedDurationMs,
+               static_cast<double>(std::numeric_limits<uint32_t>::max())));
+  const bool contentionTelemetry = evaluation.mRecentMemoryPressure ||
+                                   evaluation.mRecentHighCpu ||
+                                   evaluation.mRecentOverlap ||
+                                   evaluation.mContentionCount > 0;
+
+  Telemetry::ScalarSet(Telemetry::ScalarID::DOM_IPC_PRELAUNCH_DYNAMIC_DELAY_MS,
+                       delayMs);
+  Telemetry::ScalarSet(
+      Telemetry::ScalarID::DOM_IPC_PRELAUNCH_RECENT_LAUNCH_MS,
+      durationTelemetry);
+  Telemetry::ScalarSet(
+      Telemetry::ScalarID::DOM_IPC_PRELAUNCH_RECENT_CONTENTION,
+      contentionTelemetry);
+
+  const double cpuPercent = record.mCpuLoad
+                                ? (*record.mCpuLoad) * 100.0
+                                : std::numeric_limits<double>::quiet_NaN();
+  const double gapMs = evaluation.mGapSincePrevious
+                           ? evaluation.mGapSincePrevious->ToMilliseconds()
+                           : std::numeric_limits<double>::quiet_NaN();
+  nsAutoCString cpuString;
+  if (record.mCpuLoad) {
+    cpuString = nsPrintfCString("%.1f%%", cpuPercent);
+  } else {
+    cpuString.AssignLiteral("n/a");
+  }
 
   PROFILER_MARKER_TEXT(
       "Process", DOM, MarkerTiming::InstantAt(aReadyTime),
       nsPrintfCString(
-          "Prealloc launch %.2fms (avg %.2fms, prev %ums, delay %ums, pressure=%d)",
-          record.mDuration.ToMilliseconds(), averageDurationMs, previousDelay,
-          delayMs, recentMemoryPressure));
+          "Prealloc launch %.2fms (avg %.2fms, prev %.2fms, delay %ums, "
+          "cheap=%zu/%zu contended=%zu cpu=%s memory=%d overlap=%d gap=%.2fms)",
+          lastDurationMs, evaluation.mAverageDurationMs,
+          evaluation.mPreviousDelayMs, delayMs, evaluation.mCheapCount,
+          evaluation.mSampleCount, evaluation.mContentionCount,
+          cpuString.get(), evaluation.mRecentMemoryPressure,
+          evaluation.mRecentOverlap, gapMs));
 }
 
 uint32_t PreallocatedProcessManagerImpl::GetMinDelayMs() const {
@@ -502,75 +607,188 @@ uint32_t PreallocatedProcessManagerImpl::GetMaxDelayMs() const {
 }
 
 void PreallocatedProcessManagerImpl::LogLaunchHeuristics(
-    ContentParent* aParent, uint32_t aDelayMs, double aAverageDuration,
-    double aPreviousDelay, bool aMemoryPressure) const {
+    ContentParent* aParent, uint32_t aDelayMs,
+    const HeuristicEvaluation& aEvaluation) const {
   const double lastDurationMs =
       mRecentLaunches.IsEmpty()
           ? 0.0
           : mRecentLaunches.LastElement().mDuration.ToMilliseconds();
+  const double cpuPercent = aEvaluation.mLastCpuLoad
+                                ? (*aEvaluation.mLastCpuLoad) * 100.0
+                                : std::numeric_limits<double>::quiet_NaN();
+  const double gapMs = aEvaluation.mGapSincePrevious
+                           ? aEvaluation.mGapSincePrevious->ToMilliseconds()
+                           : std::numeric_limits<double>::quiet_NaN();
+
   MOZ_LOG(ContentParent::GetLog(), LogLevel::Info,
           ("Prealloc launch=%p duration=%.2fms avg=%.2fms prev-delay=%.2fms "
-           "memory-pressure=%d next-delay=%ums",
-           aParent, lastDurationMs, aAverageDuration, aPreviousDelay,
-           aMemoryPressure, aDelayMs));
+           "next-delay=%ums cpu=%.1f%% memory-pressure=%d overlap=%d "
+           "cheap=%zu/%zu contended=%zu high-cpu=%d gap=%.2fms",
+           aParent, lastDurationMs, aEvaluation.mAverageDurationMs,
+           aEvaluation.mPreviousDelayMs, aDelayMs, cpuPercent,
+           aEvaluation.mRecentMemoryPressure, aEvaluation.mRecentOverlap,
+           aEvaluation.mCheapCount, aEvaluation.mSampleCount,
+           aEvaluation.mContentionCount, aEvaluation.mRecentHighCpu, gapMs));
 }
 
 uint32_t PreallocatedProcessManagerImpl::ComputeDynamicDelayMs() const {
-  uint32_t prefDelay = StaticPrefs::dom_ipc_processPrelaunch_delayMs();
   const uint32_t minDelay = GetMinDelayMs();
   const uint32_t maxDelay = GetMaxDelayMs();
-
+  uint32_t prefDelay = StaticPrefs::dom_ipc_processPrelaunch_delayMs();
   prefDelay = std::clamp(prefDelay, minDelay, maxDelay);
+
+  HeuristicEvaluation evaluation;
+  if (!mRecentLaunches.IsEmpty()) {
+    evaluation.mLastCpuLoad = mRecentLaunches.LastElement().mCpuLoad;
+  }
+
+  const double minDelayDouble = static_cast<double>(minDelay);
+  const double maxDelayDouble = static_cast<double>(maxDelay);
+  const double lastDelayDouble = mLastComputedDelayMs
+                                     ? static_cast<double>(mLastComputedDelayMs)
+                                     : static_cast<double>(prefDelay);
+  evaluation.mPreviousDelayMs =
+      std::clamp(lastDelayDouble, minDelayDouble, maxDelayDouble);
 
   auto finalize = [&](uint32_t aDelay) {
     mLastComputedDelayMs = aDelay;
+    mLastHeuristicEvaluation = evaluation;
     return aDelay;
   };
 
   if (!StaticPrefs::dom_ipc_processPrelaunch_dynamicDelay_enabled()) {
+    evaluation.mSampleCount =
+        std::min<size_t>(mRecentLaunches.Length(), size_t(4));
     return finalize(prefDelay);
   }
 
   if (mRecentLaunches.IsEmpty()) {
+    evaluation.mSampleCount = 0;
+    evaluation.mAverageDurationMs = 0.0;
+    evaluation.mRecentMemoryPressure = false;
+    evaluation.mRecentHighCpu = false;
+    evaluation.mRecentOverlap = false;
+    evaluation.mCheapCount = 0;
+    evaluation.mContentionCount = 0;
     return finalize(prefDelay);
   }
 
   const size_t sampleCount =
       std::min<size_t>(mRecentLaunches.Length(), size_t(4));
-  double totalDurationMs = 0.0;
-  bool memoryPressure = false;
+  evaluation.mSampleCount = sampleCount;
+
+  AutoTArray<double, 4> durations;
+  AutoTArray<bool, 4> pressures;
+  AutoTArray<Maybe<double>, 4> cpuLoads;
+  durations.SetCapacity(sampleCount);
+  pressures.SetCapacity(sampleCount);
+  cpuLoads.SetCapacity(sampleCount);
+
+  TimeStamp previousReady;
+  bool havePreviousReady = false;
+  bool hadOverlap = false;
+
   for (size_t offset = mRecentLaunches.Length() - sampleCount;
        offset < mRecentLaunches.Length(); ++offset) {
     const auto& sample = mRecentLaunches[offset];
-    totalDurationMs += sample.mDuration.ToMilliseconds();
-    memoryPressure |= sample.mMemoryPressure;
+    durations.AppendElement(sample.mDuration.ToMilliseconds());
+    pressures.AppendElement(sample.mMemoryPressure);
+    cpuLoads.AppendElement(sample.mCpuLoad);
+    if (havePreviousReady && !sample.mStartTime.IsNull() &&
+        !previousReady.IsNull() && sample.mStartTime < previousReady) {
+      hadOverlap = true;
+    }
+    if (!sample.mReadyTime.IsNull()) {
+      previousReady = sample.mReadyTime;
+      havePreviousReady = true;
+    }
   }
 
-  const double averageDurationMs =
-      sampleCount ? (totalDurationMs / sampleCount) : 0.0;
-  const double minDelayDouble = static_cast<double>(minDelay);
-  const double maxDelayDouble = static_cast<double>(maxDelay);
-  double currentDelay =
-      mLastComputedDelayMs ? static_cast<double>(mLastComputedDelayMs)
-                           : static_cast<double>(prefDelay);
+  evaluation.mRecentOverlap = hadOverlap;
 
-  currentDelay = std::clamp(currentDelay, minDelayDouble, maxDelayDouble);
+  double totalDurationMs = 0.0;
+  for (double duration : durations) {
+    totalDurationMs += duration;
+  }
+  evaluation.mAverageDurationMs =
+      sampleCount ? (totalDurationMs / sampleCount) : 0.0;
+
+  double currentDelay = evaluation.mPreviousDelayMs;
+  const double cheapThreshold = currentDelay * 0.7;
+  const double contendedThreshold = currentDelay * 1.25;
+
+  bool anyMemoryPressure = false;
+  bool highCpuObserved = false;
+  size_t cheapCount = 0;
+  size_t contendedCount = 0;
+
+  for (size_t idx = 0; idx < sampleCount; ++idx) {
+    const double duration = durations[idx];
+    const bool pressure = pressures[idx];
+    const Maybe<double>& cpu = cpuLoads[idx];
+
+    anyMemoryPressure |= pressure;
+
+    const bool highCpu = cpu && *cpu >= (pressure ? 0.7 : 0.85);
+    highCpuObserved |= highCpu;
+
+    if (!pressure && (!cpu || *cpu <= 0.6) && duration <= cheapThreshold) {
+      cheapCount++;
+    }
+
+    if (pressure || highCpu || duration >= contendedThreshold) {
+      contendedCount++;
+    }
+  }
+
+  evaluation.mRecentMemoryPressure = anyMemoryPressure;
+  evaluation.mRecentHighCpu = highCpuObserved;
+  evaluation.mCheapCount = cheapCount;
+  evaluation.mContentionCount = contendedCount;
 
   double desiredDelay = currentDelay;
-  if (memoryPressure) {
-    desiredDelay = std::max(currentDelay * 1.25, averageDurationMs);
-  } else if (averageDurationMs > 0.0) {
-    const double cheapThreshold = currentDelay * 0.7;
-    const double contendedThreshold = currentDelay * 1.3;
-    if (averageDurationMs <= cheapThreshold) {
-      desiredDelay = (currentDelay * 0.5) + (averageDurationMs * 0.5);
-    } else if (averageDurationMs >= contendedThreshold) {
-      desiredDelay = std::max(currentDelay * 1.2, averageDurationMs);
-    } else {
-      desiredDelay = (currentDelay * 0.75) + (averageDurationMs * 0.25);
+  const bool experiencedContention =
+      anyMemoryPressure || highCpuObserved || hadOverlap || contendedCount > 0;
+
+  if (experiencedContention) {
+    double severity = static_cast<double>(contendedCount);
+    if (anyMemoryPressure) {
+      severity += 0.5;
     }
+    if (highCpuObserved) {
+      severity += 0.5;
+    }
+    if (hadOverlap) {
+      severity += 0.5;
+    }
+    const double scale = 1.0 + std::min(severity * 0.15, 1.0);
+    const double durationTarget = evaluation.mAverageDurationMs > 0.0
+                                      ? std::max(evaluation.mAverageDurationMs * 1.1,
+                                                 currentDelay)
+                                      : currentDelay;
+    desiredDelay = std::max(currentDelay * scale, durationTarget);
+  } else if (cheapCount >= sampleCount && sampleCount > 0) {
+    desiredDelay = std::max(
+        minDelayDouble,
+        std::min(currentDelay * 0.6,
+                 evaluation.mAverageDurationMs > 0.0
+                     ? std::max(evaluation.mAverageDurationMs * 0.85,
+                                minDelayDouble)
+                     : currentDelay * 0.6));
+  } else if (cheapCount * 2 >= sampleCount && sampleCount > 0) {
+    desiredDelay = std::max(
+        minDelayDouble,
+        (currentDelay * 0.7) +
+            (evaluation.mAverageDurationMs > 0.0
+                 ? (evaluation.mAverageDurationMs * 0.3)
+                 : 0.0));
   } else {
-    desiredDelay = std::max(minDelayDouble, currentDelay * 0.8);
+    desiredDelay = std::max(
+        minDelayDouble,
+        (currentDelay * 0.9) +
+            (evaluation.mAverageDurationMs > 0.0
+                 ? (evaluation.mAverageDurationMs * 0.1)
+                 : 0.0));
   }
 
   desiredDelay = std::clamp(desiredDelay, minDelayDouble, maxDelayDouble);
@@ -579,8 +797,7 @@ uint32_t PreallocatedProcessManagerImpl::ComputeDynamicDelayMs() const {
       static_cast<uint32_t>(std::lround(desiredDelay));
   computedDelay = std::clamp(computedDelay, minDelay, maxDelay);
 
-  mLastComputedDelayMs = computedDelay;
-  return computedDelay;
+  return finalize(computedDelay);
 }
 
 void PreallocatedProcessManagerImpl::Disable() {
