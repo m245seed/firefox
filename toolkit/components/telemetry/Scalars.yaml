@@ -7261,6 +7261,50 @@ places:
     record_in_processes:
       - main
 
+dom:
+  ipc_prelaunch:
+    dynamic_delay_ms:
+      bug_numbers:
+        - 0
+      description: >
+        Last computed delay in milliseconds before launching a new preallocated
+        content process.
+      expires: never
+      kind: uint
+      notification_emails:
+        - perf-telemetry-alerts@mozilla.com
+      release_channel_collection: opt-out
+      record_in_processes:
+        - 'main'
+
+    recent_launch_ms:
+      bug_numbers:
+        - 0
+      description: >
+        Launch duration in milliseconds for the most recently completed
+        preallocated content process startup.
+      expires: never
+      kind: uint
+      notification_emails:
+        - perf-telemetry-alerts@mozilla.com
+      release_channel_collection: opt-out
+      record_in_processes:
+        - 'main'
+
+    recent_contention:
+      bug_numbers:
+        - 0
+      description: >
+        Whether the most recent preallocated content process launch detected
+        contention (memory pressure, CPU saturation, or overlapping launches).
+      expires: never
+      kind: boolean
+      notification_emails:
+        - perf-telemetry-alerts@mozilla.com
+      release_channel_collection: opt-out
+      record_in_processes:
+        - 'main'
+
 # NOTE: Please don't add new definitions below this point. Consider adding
 # them earlier in the file and leave the telemetry.test category as the last
 # one for readability.
