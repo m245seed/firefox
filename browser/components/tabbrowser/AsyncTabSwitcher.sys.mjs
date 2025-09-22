@@ -325,6 +325,10 @@ export class AsyncTabSwitcher {
     return this.tabbrowser._tabLayerCache;
   }
 
+  get tabLayerCacheSet() {
+    return this.tabbrowser._tabLayerCacheSet;
+  }
+
   finish() {
     this.log("FINISH");
 
@@ -573,6 +577,7 @@ export class AsyncTabSwitcher {
       if (!tab.linkedBrowser) {
         this.tabState.delete(tab);
         this.tabLayerCache.splice(i, 1);
+        this.tabLayerCacheSet.delete(tab);
         i--;
       }
     }
@@ -650,6 +655,7 @@ export class AsyncTabSwitcher {
     // See how many tabs still have work to do.
     let numPending = 0;
     let numWarming = 0;
+    const { gBrowser } = this.window;
     for (let [tab, state] of this.tabState) {
       // In certain cases, tabs that are backgrounded should stay in the
       // STATE_LOADED state, as some mechanisms rely on background rendering.
@@ -670,7 +676,7 @@ export class AsyncTabSwitcher {
       if (
         state == this.STATE_LOADED &&
         tab !== this.requestedTab &&
-        !this.tabLayerCache.includes(tab)
+        !gBrowser._tabLayerCacheSet.has(tab)
       ) {
         numPending++;
 
@@ -736,6 +742,7 @@ export class AsyncTabSwitcher {
   unloadNonRequiredTabs() {
     this.warmingTabs = new WeakSet();
     let numPending = 0;
+    const { gBrowser } = this.window;
 
     // Unload any tabs that can be unloaded.
     for (let [tab, state] of this.tabState) {
@@ -743,7 +750,7 @@ export class AsyncTabSwitcher {
         continue;
       }
 
-      let isInLayerCache = this.tabLayerCache.includes(tab);
+      let isInLayerCache = gBrowser._tabLayerCacheSet.has(tab);
 
       if (
         state == this.STATE_LOADED &&
@@ -1013,6 +1020,7 @@ export class AsyncTabSwitcher {
 
   cleanUpTabAfterEviction(tab) {
     this.assert(tab !== this.requestedTab);
+    this.tabLayerCacheSet.delete(tab);
     let browser = tab.linkedBrowser;
     if (browser) {
       browser.preserveLayers(false);
@@ -1026,18 +1034,22 @@ export class AsyncTabSwitcher {
   }
 
   maybePromoteTabInLayerCache(tab) {
+    const { gBrowser } = this.window;
     if (
       lazy.gTabCacheSize > 1 &&
       tab.linkedBrowser.isRemoteBrowser &&
       tab.linkedBrowser.currentURI.spec != "about:blank"
     ) {
-      let tabIndex = this.tabLayerCache.indexOf(tab);
+      if (gBrowser._tabLayerCacheSet.has(tab)) {
+        let tabIndex = this.tabLayerCache.indexOf(tab);
 
-      if (tabIndex != -1) {
-        this.tabLayerCache.splice(tabIndex, 1);
+        if (tabIndex != -1) {
+          this.tabLayerCache.splice(tabIndex, 1);
+        }
       }
 
       this.tabLayerCache.push(tab);
+      this.tabLayerCacheSet.add(tab);
 
       if (this.tabLayerCache.length > lazy.gTabCacheSize) {
         this.evictOldestTabFromCache();
@@ -1258,12 +1270,14 @@ export class AsyncTabSwitcher {
       return;
     }
 
+    const { gBrowser } = this.window;
+
     let getTabString = tab => {
       let tabString = "";
 
       let state = this.getTabState(tab);
       let isWarming = this.warmingTabs.has(tab);
-      let isCached = this.tabLayerCache.includes(tab);
+      let isCached = gBrowser._tabLayerCacheSet.has(tab);
       let isClosing = tab.closing;
       let linkedBrowser = tab.linkedBrowser;
       let isActive = linkedBrowser && linkedBrowser.docShellIsActive;
