@@ -325,6 +325,10 @@ export class AsyncTabSwitcher {
     return this.tabbrowser._tabLayerCache;
   }
 
+  get tabLayerCacheSet() {
+    return this.tabbrowser._tabLayerCacheSet;
+  }
+
   finish() {
     this.log("FINISH");
 
@@ -572,6 +576,7 @@ export class AsyncTabSwitcher {
       let tab = this.tabLayerCache[i];
       if (!tab.linkedBrowser) {
         this.tabState.delete(tab);
+        this.tabLayerCacheSet.delete(tab);
         this.tabLayerCache.splice(i, 1);
         i--;
       }
@@ -670,7 +675,7 @@ export class AsyncTabSwitcher {
       if (
         state == this.STATE_LOADED &&
         tab !== this.requestedTab &&
-        !this.tabLayerCache.includes(tab)
+        !this.tabLayerCacheSet.has(tab)
       ) {
         numPending++;
 
@@ -743,7 +748,7 @@ export class AsyncTabSwitcher {
         continue;
       }
 
-      let isInLayerCache = this.tabLayerCache.includes(tab);
+      let isInLayerCache = this.tabLayerCacheSet.has(tab);
 
       if (
         state == this.STATE_LOADED &&
@@ -1022,6 +1027,10 @@ export class AsyncTabSwitcher {
 
   evictOldestTabFromCache() {
     let tab = this.tabLayerCache.shift();
+    if (!tab) {
+      return;
+    }
+    this.tabLayerCacheSet.delete(tab);
     this.cleanUpTabAfterEviction(tab);
   }
 
@@ -1031,13 +1040,17 @@ export class AsyncTabSwitcher {
       tab.linkedBrowser.isRemoteBrowser &&
       tab.linkedBrowser.currentURI.spec != "about:blank"
     ) {
-      let tabIndex = this.tabLayerCache.indexOf(tab);
-
-      if (tabIndex != -1) {
-        this.tabLayerCache.splice(tabIndex, 1);
+      if (this.tabLayerCacheSet.has(tab)) {
+        let tabIndex = this.tabLayerCache.indexOf(tab);
+        this.assert(tabIndex != -1);
+        if (tabIndex != -1) {
+          this.tabLayerCache.splice(tabIndex, 1);
+        }
+        this.tabLayerCacheSet.delete(tab);
       }
 
       this.tabLayerCache.push(tab);
+      this.tabLayerCacheSet.add(tab);
 
       if (this.tabLayerCache.length > lazy.gTabCacheSize) {
         this.evictOldestTabFromCache();
@@ -1263,7 +1276,7 @@ export class AsyncTabSwitcher {
 
       let state = this.getTabState(tab);
       let isWarming = this.warmingTabs.has(tab);
-      let isCached = this.tabLayerCache.includes(tab);
+      let isCached = this.tabLayerCacheSet.has(tab);
       let isClosing = tab.closing;
       let linkedBrowser = tab.linkedBrowser;
       let isActive = linkedBrowser && linkedBrowser.docShellIsActive;
