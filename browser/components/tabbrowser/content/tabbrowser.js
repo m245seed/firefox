@@ -257,6 +257,8 @@
 
     _tabLayerCache = [];
 
+    _tabLayerCacheSet = new Set();
+
     tabAnimationsInProgress = 0;
 
     /**
@@ -5120,6 +5122,7 @@
       if (tabCacheIndex != -1) {
         this._tabLayerCache.splice(tabCacheIndex, 1);
       }
+      this._tabLayerCacheSet.delete(aTab);
 
       // Delay hiding the the active tab if we're screen sharing.
       // See Bug 1642747.
@@ -8724,6 +8727,7 @@
             gBrowser._tabLayerCache.splice(tabCacheIndex, 1);
             gBrowser._getSwitcher().cleanUpTabAfterEviction(this.mTab);
           }
+          gBrowser._tabLayerCacheSet.delete(this.mTab);
         }
       }
 
