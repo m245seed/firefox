@@ -2,7 +2,17 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+/* global performance */
+
 "use strict";
+
+const TAB_URLS_TO_EXCLUDE = [
+  "about:newtab",
+  "about:home",
+  "about:privatebrowsing",
+  "chrome://browser/content/blanktab.html",
+  "about:firefoxview",
+];
 
 /**
  * Generates a dummy tab with title, url and description
@@ -177,5 +187,81 @@ add_task(async function test_tabs_to_suggest_should_exclude_firefox_view() {
     tabsToSuggest,
     [2, 4, 6],
     "about:firefoxview should be excluded"
+  );
+});
+
+add_task(async function test_tabs_to_suggest_matches_naive_and_perf_budget() {
+  const smartTabGroupingManager = new SmartTabGroupingManager();
+  const tabCount = 500;
+  const allTabData = Array.from({ length: tabCount }, (_, index) =>
+    generateTabWithInfo({
+      title: `Random Tab ${index}`,
+      url:
+        index % 17 === 0
+          ? "about:newtab"
+          : index % 19 === 0
+            ? "about:home"
+            : `https://example.com/${index}`,
+      description: `description-${index}`,
+    })
+  );
+  const preppedData = await smartTabGroupingManager._prepareTabData(allTabData);
+
+  const groupedIndices = [];
+  const alreadyGroupedIndices = [];
+  for (let i = 0; i < tabCount; i += 7) {
+    groupedIndices.push(i);
+  }
+  for (let i = 0; i < tabCount; i += 11) {
+    alreadyGroupedIndices.push(i);
+  }
+  // add duplicates to mimic window history churn
+  groupedIndices.push(...groupedIndices.slice(0, 5));
+  alreadyGroupedIndices.push(...alreadyGroupedIndices.slice(0, 5));
+
+  const naiveExcluded = [
+    ...groupedIndices,
+    ...alreadyGroupedIndices,
+    ...preppedData
+      .map((tab, index) => (TAB_URLS_TO_EXCLUDE.includes(tab.url) ? index : -1))
+      .filter(index => index !== -1),
+  ];
+  const naiveResult = preppedData
+    .map((_, index) => index)
+    .filter(i => !naiveExcluded.includes(i));
+
+  const originalHas = Set.prototype.has;
+  let hasCalls = 0;
+  Set.prototype.has = function(value) {
+    hasCalls++;
+    return originalHas.call(this, value);
+  };
+
+  let suggested;
+  let duration = 0;
+  try {
+    const start = performance.now();
+    suggested = smartTabGroupingManager.getTabsToSuggest(
+      preppedData,
+      groupedIndices,
+      alreadyGroupedIndices
+    );
+    duration = performance.now() - start;
+  } finally {
+    Set.prototype.has = originalHas;
+  }
+
+  Assert.deepEqual(
+    suggested,
+    naiveResult,
+    "Set-backed implementation should match naive reference"
+  );
+  Assert.ok(
+    hasCalls <= preppedData.length + groupedIndices.length,
+    "Membership checks should stay O(n)"
+  );
+  Assert.ok(
+    duration < 50,
+    "Method should run within reasonable time budget for large input"
   );
 });
