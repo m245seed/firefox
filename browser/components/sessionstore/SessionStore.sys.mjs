@@ -670,6 +670,10 @@ export var SessionStore = {
     return SessionStoreInternal.getCurrentState(aUpdateAll);
   },
 
+  getCurrentStateAsync(aUpdateAll, options) {
+    return SessionStoreInternal.getCurrentStateAsync(aUpdateAll, options);
+  },
+
   reviveCrashedTab(aTab) {
     return SessionStoreInternal.reviveCrashedTab(aTab);
   },
@@ -5485,6 +5489,165 @@ var SessionStoreInternal = {
         if (!winData.isPopup) {
           nonPopupCount++;
         }
+      }
+    }
+
+    // shallow copy this._closedWindows to preserve current state
+    let lastClosedWindowsCopy = this._closedWindows.slice();
+
+    if (AppConstants.platform != "macosx") {
+      // If no non-popup browser window remains open, return the state of the last
+      // closed window(s). We only want to do this when we're actually "ending"
+      // the session.
+      // XXXzpao We should do this for _restoreLastWindow == true, but that has
+      //        its own check for popups. c.f. bug 597619
+      if (
+        nonPopupCount == 0 &&
+        !!lastClosedWindowsCopy.length &&
+        lazy.RunState.isQuitting
+      ) {
+        // prepend the last non-popup browser window, so that if the user loads more tabs
+        // at startup we don't accidentally add them to a popup window
+        do {
+          total.unshift(lastClosedWindowsCopy.shift());
+        } while (total[0].isPopup && lastClosedWindowsCopy.length);
+      }
+    }
+
+    if (activeWindow) {
+      this.activeWindowSSiCache = activeWindow.__SSi || "";
+    }
+    ix = ids.indexOf(this.activeWindowSSiCache);
+    // We don't want to restore focus to a minimized window or a window which had all its
+    // tabs stripped out (doesn't exist).
+    if (ix != -1 && total[ix] && total[ix].sizemode == "minimized") {
+      ix = -1;
+    }
+
+    let session = {
+      lastUpdate: Date.now(),
+      startTime: this._sessionStartTime,
+      recentCrashes: this._recentCrashes,
+    };
+
+    let state = {
+      version: ["sessionrestore", FORMAT_VERSION],
+      windows: total,
+      selectedWindow: ix + 1,
+      _closedWindows: lastClosedWindowsCopy,
+      savedGroups: this._savedGroups,
+      session,
+      global: this._globalState.getState(),
+    };
+
+    // Collect and store session cookies.
+    state.cookies = lazy.SessionCookies.collect();
+
+    lazy.DevToolsShim.saveDevToolsSession(state);
+
+    // Persist the last session if we deferred restoring it
+    if (LastSession.canRestore) {
+      state.lastSessionState = LastSession.getState();
+    }
+
+    // If we were called by the SessionSaver and started with only a private
+    // window we want to pass the deferred initial state to not lose the
+    // previous session.
+    if (this._deferredInitialState) {
+      state.deferredInitialState = this._deferredInitialState;
+    }
+
+    return state;
+  },
+
+  /**
+   * Asynchronously gather session data as object.
+   *
+   * This mirrors getCurrentState but yields to the main thread between
+   * processing windows so that we do not monopolize the event loop when the
+   * session state is large. Callers that care about responsiveness while a
+   * save is in progress should use this entry point instead of getCurrentState.
+   *
+   * @param {boolean} aUpdateAll
+   *        True if all windows should be re-collected regardless of whether
+   *        they have been marked dirty since the last save.
+   * @param {{ chunkSize?: number }} options
+   *        Optional configuration object allowing callers to control how often
+   *        the collector yields back to the event loop. A chunkSize of `n`
+   *        means that we yield after every `n` processed windows. Defaults to 1
+   *        (yield after every window). A chunkSize of 0 disables yielding.
+   * @returns {Promise<object>}
+   */
+  async getCurrentStateAsync(aUpdateAll, options = {}) {
+    this._handleClosedWindows().then(() => {
+      this._notifyOfClosedObjectsChange();
+    });
+
+    var activeWindow = this._getTopWindow();
+
+    let chunkSize = options.chunkSize ?? 1;
+    let processedSinceYield = 0;
+
+    let maybeYield = async () => {
+      if (chunkSize > 0 && ++processedSinceYield >= chunkSize) {
+        processedSinceYield = 0;
+        await new Promise(resolve =>
+          Services.tm.dispatchToMainThread(resolve)
+        );
+      }
+    };
+
+    let timerId = Glean.sessionRestore.collectAllWindowsData.start();
+    if (lazy.RunState.isRunning) {
+      let index = 0;
+      for (let window of this._orderedBrowserWindows) {
+        if (!this._isWindowLoaded(window)) {
+          continue;
+        }
+        if (aUpdateAll || DirtyWindows.has(window) || window == activeWindow) {
+          this._collectWindowData(window);
+        } else {
+          this._updateWindowFeatures(window);
+        }
+        this._windows[window.__SSi].zIndex = ++index;
+
+        // Yield to the main thread to keep the UI responsive for large states.
+        await maybeYield();
+      }
+      DirtyWindows.clear();
+    }
+    Glean.sessionRestore.collectAllWindowsData.stopAndAccumulate(timerId);
+
+    // An array that at the end will hold all current window data.
+    var total = [];
+    // The ids of all windows contained in 'total' in the same order.
+    var ids = [];
+    // The number of window that are _not_ popups.
+    var nonPopupCount = 0;
+    var ix;
+
+    // collect the data for all windows
+    for (ix in this._windows) {
+      if (this._windows[ix]._restoring || this._windows[ix].isTaskbarTab) {
+        // window data is still in _statesToRestore
+        continue;
+      }
+      total.push(this._windows[ix]);
+      ids.push(ix);
+      if (!this._windows[ix].isPopup) {
+        nonPopupCount++;
+      }
+      await maybeYield();
+    }
+
+    // collect the data for all windows yet to be restored
+    for (ix in this._statesToRestore) {
+      for (let winData of this._statesToRestore[ix].windows) {
+        total.push(winData);
+        if (!winData.isPopup) {
+          nonPopupCount++;
+        }
+        await maybeYield();
       }
     }
 

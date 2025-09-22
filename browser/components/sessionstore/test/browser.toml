@@ -67,6 +67,8 @@ skip-if = [
   "os == 'win' && os_version == '11.26100' && bits == 64 && asan", # Bug 1787024
 ]
 
+["browser_async_save_collect.js"]
+
 ["browser_async_window_flushing.js"]
 https_first_disabled = true
 skip-if = [
