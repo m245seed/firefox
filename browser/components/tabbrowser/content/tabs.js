@@ -21,9 +21,12 @@
 
     #mustUpdateTabMinHeight = false;
     #tabMinHeight = 36;
+    #audioLabelMessages = new Map();
 
     constructor() {
       super();
+
+      this._lockedWidthTabs = new Set();
 
       this.addEventListener("TabSelect", this);
       this.addEventListener("TabClose", this);
@@ -153,6 +156,7 @@
       this.boundObserve = (...args) => this.observe(...args);
       Services.prefs.addObserver("privacy.userContext", this.boundObserve);
       this.observe(null, "nsPref:changed", "privacy.userContext.enabled");
+      Services.obs.addObserver(this.boundObserve, "intl:app-locales-changed");
 
       document
         .getElementById("vertical-tabs-newtab-button")
@@ -291,6 +295,7 @@
     }
 
     on_TabClose(event) {
+      this._lockedWidthTabs.delete(event.target);
       this._hiddenSoundPlayingStatusChanged(event.target, { closed: true });
     }
 
@@ -1096,7 +1101,7 @@
       }
     }
 
-    observe(aSubject, aTopic) {
+    observe(aSubject, aTopic, aData) {
       switch (aTopic) {
         case "nsPref:changed":
           // This is has to deal with changes in
@@ -1164,6 +1169,9 @@
             }
           }
 
+          break;
+        case "intl:app-locales-changed":
+          this.#audioLabelMessages.clear();
           break;
       }
     }
@@ -1293,9 +1301,11 @@
         }
         aTabWidth += "px";
         let tabsToReset = [];
+        this._lockedWidthTabs.clear();
         for (let i = numPinned; i < tabs.length; i++) {
           let tab = tabs[i];
           tab.style.setProperty("max-width", aTabWidth, "important");
+          this._lockedWidthTabs.add(tab);
           if (!isEndTab) {
             // keep tabs the same width
             tab.style.transition = "none";
@@ -1335,13 +1345,10 @@
 
       if (this._hasTabTempMaxWidth) {
         this._hasTabTempMaxWidth = false;
-        // Only visible tabs have their sizes locked, but those visible tabs
-        // could become invisible before being unlocked (e.g. by being inside
-        // of a collapsing tab group), so it's better to reset all tabs.
-        let tabs = this.allTabs;
-        for (let i = 0; i < tabs.length; i++) {
-          tabs[i].style.maxWidth = "";
+        for (const tab of this._lockedWidthTabs) {
+          tab.style.maxWidth = "";
         }
+        this._lockedWidthTabs.clear();
       }
 
       if (this.hasAttribute("using-closing-tabs-spacer")) {
@@ -1572,31 +1579,46 @@
     destroy() {
       if (this.boundObserve) {
         Services.prefs.removeObserver("privacy.userContext", this.boundObserve);
+        Services.obs.removeObserver(this.boundObserve, "intl:app-locales-changed");
       }
       CustomizableUI.removeListener(this);
     }
 
-    updateTabSoundLabel(tab) {
-      // Add aria-label for inline audio button
-      const [unmute, mute, unblock] =
-        gBrowser.tabLocalization.formatMessagesSync([
+    #getAudioLabelMessage(messageId) {
+      if (!this.#audioLabelMessages.size) {
+        const messageIds = [
           "tabbrowser-unmute-tab-audio-aria-label",
           "tabbrowser-mute-tab-audio-aria-label",
           "tabbrowser-unblock-tab-audio-aria-label",
-        ]);
-      if (tab.audioButton) {
-        if (tab.hasAttribute("muted") || tab.hasAttribute("soundplaying")) {
-          let ariaLabel;
-          tab.linkedBrowser.audioMuted
-            ? (ariaLabel = unmute.attributes[0].value)
-            : (ariaLabel = mute.attributes[0].value);
-          tab.audioButton.setAttribute("aria-label", ariaLabel);
-        } else if (tab.hasAttribute("activemedia-blocked")) {
-          tab.audioButton.setAttribute(
-            "aria-label",
-            unblock.attributes[0].value
+        ];
+        const messages = gBrowser.tabLocalization.formatMessagesSync(messageIds);
+        for (let i = 0; i < messageIds.length; i++) {
+          const message = messages[i];
+          this.#audioLabelMessages.set(
+            messageIds[i],
+            message?.attributes?.[0]?.value ?? ""
           );
         }
+      }
+      return this.#audioLabelMessages.get(messageId) ?? "";
+    }
+
+    updateTabSoundLabel(tab) {
+      if (!tab.audioButton) {
+        return;
+      }
+
+      if (tab.hasAttribute("muted") || tab.hasAttribute("soundplaying")) {
+        const messageId = tab.linkedBrowser.audioMuted
+          ? "tabbrowser-unmute-tab-audio-aria-label"
+          : "tabbrowser-mute-tab-audio-aria-label";
+        const ariaLabel = this.#getAudioLabelMessage(messageId);
+        tab.audioButton.setAttribute("aria-label", ariaLabel);
+      } else if (tab.hasAttribute("activemedia-blocked")) {
+        const ariaLabel = this.#getAudioLabelMessage(
+          "tabbrowser-unblock-tab-audio-aria-label"
+        );
+        tab.audioButton.setAttribute("aria-label", ariaLabel);
       }
     }
   }
